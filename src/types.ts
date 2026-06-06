@@ -44,6 +44,7 @@ export type MediaGroup = {
   totalSize: number;
   sourceKeys: string[];
   files: ResourceVariant[];
+  childGroups: MediaGroup[];
 };
 
 export type LibraryData = {

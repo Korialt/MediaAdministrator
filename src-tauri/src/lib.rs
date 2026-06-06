@@ -70,6 +70,7 @@ struct MediaGroup {
     total_size: i64,
     source_keys: Vec<String>,
     files: Vec<ResourceVariant>,
+    child_groups: Vec<MediaGroup>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -812,11 +813,9 @@ fn infer_video_series(
     root_path: &Path,
     parsed: &ParsedName,
 ) -> (Option<String>, Option<String>) {
-    if is_detected_title(&parsed.title_guess) {
-        return (
-            Some(parsed.title_guess.clone()),
-            Some("filename".to_string()),
-        );
+    let parsed_title = normalize_series_title(&parsed.title_guess);
+    if is_detected_title(&parsed_title) {
+        return (Some(parsed_title), Some("filename".to_string()));
     }
 
     if let Some(series) = infer_series_from_directory(path, root_path) {
@@ -825,7 +824,7 @@ fn infer_video_series(
 
     if parsed.title_guess != "未命名资源" {
         return (
-            Some(parsed.title_guess.clone()),
+            Some(normalize_series_title(&parsed.title_guess)),
             Some("filename".to_string()),
         );
     }
@@ -838,7 +837,7 @@ fn infer_series_from_directory(path: &Path, root_path: &Path) -> Option<String> 
     for component in components.iter().rev() {
         if let Some(candidate) = clean_group_name(component) {
             if !is_generic_video_directory(&candidate) {
-                return Some(candidate);
+                return Some(normalize_series_title(&candidate));
             }
         }
     }
@@ -913,6 +912,85 @@ fn is_generic_video_directory(value: &str) -> bool {
             | "movie"
             | "movies"
     )
+}
+
+fn normalize_series_title(value: &str) -> String {
+    let cleaned = clean_title(value);
+    if cleaned == "未命名资源" {
+        return cleaned;
+    }
+
+    let episode_suffix =
+        Regex::new(r"(?i)\s+-\s*\d{1,4}(?:v\d+)?$").expect("valid episode suffix regex");
+    let without_episode = episode_suffix.replace(&cleaned, " ");
+    let normalized = without_episode
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(&['-', '.', '_', ' '][..])
+        .to_string();
+
+    if normalized.is_empty() {
+        "未命名资源".to_string()
+    } else {
+        canonicalize_ascii_title(&normalized)
+    }
+}
+
+fn canonicalize_ascii_title(value: &str) -> String {
+    let small_words = [
+        "a", "an", "and", "as", "at", "for", "in", "no", "of", "on", "or", "the", "to",
+    ];
+    value
+        .split_whitespace()
+        .enumerate()
+        .map(|(index, word)| {
+            if !word.chars().any(|ch| ch.is_ascii_alphabetic()) {
+                return word.to_string();
+            }
+            if word
+                .chars()
+                .any(|ch| !ch.is_ascii_alphabetic() && ch != '-' && ch != '\'')
+            {
+                return word.to_string();
+            }
+            if word.chars().all(|ch| ch.is_ascii_uppercase()) && word.len() <= 5 {
+                return word.to_string();
+            }
+
+            word.split('-')
+                .map(|part| {
+                    let lower = part.to_ascii_lowercase();
+                    if index > 0 && small_words.contains(&lower.as_str()) {
+                        return lower;
+                    }
+
+                    let mut chars = lower.chars();
+                    match chars.next() {
+                        Some(first) => {
+                            format!(
+                                "{}{}",
+                                first.to_ascii_uppercase(),
+                                chars.collect::<String>()
+                            )
+                        }
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("-")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn infer_series_family_title(series: &str) -> Option<String> {
+    let key = normalize_key(series);
+    if key != "monogatari" && key.contains("monogatari") {
+        return Some("Monogatari".to_string());
+    }
+
+    None
 }
 
 fn build_item_key(title: &str, season_number: Option<i64>, episode_number: Option<i64>) -> String {
@@ -992,7 +1070,7 @@ fn parse_name(file_name: &str) -> ParsedName {
 fn detect_season_episode(value: &str) -> Option<(usize, i64, i64)> {
     let patterns = [
         Regex::new(r"(?i)S(\d{1,2})[\s._-]*E(\d{1,3})").ok()?,
-        Regex::new(r"(?i)(\d{1,2})x(\d{1,3})").ok()?,
+        Regex::new(r"(?i)(?:^|[\s._-])(\d{1,2})x(\d{1,3})(?:\D|$)").ok()?,
     ];
 
     for pattern in patterns {
@@ -1009,6 +1087,7 @@ fn detect_season_episode(value: &str) -> Option<(usize, i64, i64)> {
 
 fn detect_anime_episode(value: &str) -> Option<(usize, i64)> {
     let patterns = [
+        Regex::new(r"(?i)\s+-\s*(\d{1,4})(?:v\d+)?\b").ok()?,
         Regex::new(r"(?i)\s-\s(\d{1,3})(?:v\d+)?(?:\s|$|\[|\()").ok()?,
         Regex::new(r"(?i)[\s._-](\d{1,3})(?:v\d+)?(?:\s|$|\[|\()").ok()?,
     ];
@@ -1075,14 +1154,24 @@ fn detect_source(value: &str) -> Option<String> {
 
 fn clean_title(value: &str) -> String {
     let tag_pattern = Regex::new(
-        r"(?i)\b(2160p|1080p|720p|480p|4k|8k|web[- ]?dl|webrip|bdrip|blu[- ]?ray|bdremux|remux|hdtv|x264|x265|h\.?264|h\.?265|hevc|av1|aac|flac|truehd|dts|10bit|8bit|hdr|dv)\b",
+        r"(?i)\b(3840x2160|1920x1080|1280x720|2160p|1080p|720p|480p|4k|8k|bd[- ]?box|web[- ]?dl|webrip|bdrip|blu[- ]?ray|bdremux|remux|hdtv|x264|x265|h\.?264|h\.?265|avc|hevc|av1|aacx\d+|aac|flac|truehd|dts|12[- ]?bit|10[- ]?bit|8[- ]?bit|hdr|dv)\b",
     )
     .expect("valid tag regex");
     let bracket_pattern = Regex::new(r"[\[\(][^\]\)]*[\]\)]").expect("valid bracket regex");
+    let technical_suffix_pattern = Regex::new(
+        r"(?i)\s+-\s+(?:bd[- ]?box|bd|blu[- ]?ray|dvd|web[- ]?dl|webrip|remux|disc\s*\d+|vol\.?\s*\d+).*$",
+    )
+    .expect("valid technical suffix regex");
+    let unclosed_technical_pattern = Regex::new(
+        r"(?i)\s*[\[\(](?:bd|blu[- ]?ray|dvd|web[- ]?dl|webrip|remux|hdtv|uhd|3840x2160|1920x1080|1280x720|2160p|1080p|720p|avc|hevc|x264|x265|aac|flac|dts|12[- ]?bit|10[- ]?bit).*$",
+    )
+    .expect("valid unclosed technical regex");
     let separated = value.replace('.', " ").replace('_', " ");
-    let no_tags = tag_pattern.replace_all(&separated, " ");
+    let no_technical_suffix = technical_suffix_pattern.replace(&separated, " ");
+    let no_tags = tag_pattern.replace_all(&no_technical_suffix, " ");
     let no_brackets = bracket_pattern.replace_all(&no_tags, " ");
-    let cleaned = no_brackets
+    let no_unclosed_technical = unclosed_technical_pattern.replace(&no_brackets, " ");
+    let cleaned = no_unclosed_technical
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1403,29 +1492,37 @@ fn push_video_file_into_series_group(
     file: ResourceVariant,
     rules: &HashMap<String, String>,
 ) {
-    let series = file
+    let detected_series = file
         .series_title
         .clone()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
             if is_detected_title(&file.title_guess) {
-                Some(file.title_guess.clone())
+                Some(normalize_series_title(&file.title_guess))
             } else {
                 infer_series_from_directory(Path::new(&file.path), Path::new(&file.root_path))
             }
         })
         .unwrap_or_else(|| "未识别系列".to_string());
-    let source_key = group_source_key("video_series", &series);
+    let source_key = group_source_key("video_series", &detected_series);
+    let series = apply_merge_rule(&source_key, detected_series, rules);
     let subtitle = file.series_source.as_deref().map(series_source_label);
-    push_file_into_group(
-        groups,
-        "video_series",
-        source_key,
-        series,
-        subtitle,
-        file,
-        rules,
-    );
+
+    if let Some(family_name) = infer_series_family_title(&series) {
+        let parent_source_key = group_source_key("video_series", &family_name);
+        let parent_name = apply_merge_rule(&parent_source_key, family_name, rules);
+        push_file_into_family_group(
+            groups,
+            parent_source_key,
+            parent_name,
+            source_key,
+            series,
+            subtitle,
+            file,
+        );
+    } else {
+        push_file_into_named_group(groups, "video_series", source_key, series, subtitle, file);
+    }
 }
 
 fn push_file_into_group(
@@ -1437,11 +1534,78 @@ fn push_file_into_group(
     file: ResourceVariant,
     rules: &HashMap<String, String>,
 ) {
-    let display_name = rules
-        .get(&source_key)
+    let display_name = apply_merge_rule(&source_key, detected_name, rules);
+    push_file_into_named_group(groups, kind, source_key, display_name, subtitle, file);
+}
+
+fn apply_merge_rule(
+    source_key: &str,
+    detected_name: String,
+    rules: &HashMap<String, String>,
+) -> String {
+    rules
+        .get(source_key)
         .filter(|value| !value.trim().is_empty())
         .cloned()
-        .unwrap_or(detected_name);
+        .unwrap_or(detected_name)
+}
+
+fn push_file_into_family_group(
+    groups: &mut Vec<MediaGroup>,
+    parent_source_key: String,
+    parent_name: String,
+    child_source_key: String,
+    child_name: String,
+    child_subtitle: Option<String>,
+    file: ResourceVariant,
+) {
+    let parent_key = group_source_key("video_series", &parent_name);
+    let parent_index = match groups.iter().position(|group| group.key == parent_key) {
+        Some(index) => index,
+        None => {
+            groups.push(MediaGroup {
+                key: parent_key.clone(),
+                name: parent_name,
+                subtitle: Some("作品族".to_string()),
+                file_count: 0,
+                total_size: 0,
+                source_keys: Vec::new(),
+                files: Vec::new(),
+                child_groups: Vec::new(),
+            });
+            groups.len() - 1
+        }
+    };
+
+    let parent = &mut groups[parent_index];
+    if !parent
+        .source_keys
+        .iter()
+        .any(|key| key == &parent_source_key)
+    {
+        parent.source_keys.push(parent_source_key);
+    }
+    parent.file_count += 1;
+    parent.total_size += file.file_size;
+    parent.files.push(file.clone());
+    push_file_into_named_group(
+        &mut parent.child_groups,
+        "video_series",
+        child_source_key,
+        child_name,
+        child_subtitle,
+        file,
+    );
+}
+
+fn push_file_into_named_group(
+    groups: &mut Vec<MediaGroup>,
+    kind: &str,
+    source_key: String,
+    display_name: String,
+    subtitle: Option<String>,
+    file: ResourceVariant,
+) {
     let group_key = group_source_key(kind, &display_name);
 
     let group_index = match groups.iter().position(|group| group.key == group_key) {
@@ -1455,6 +1619,7 @@ fn push_file_into_group(
                 total_size: 0,
                 source_keys: Vec::new(),
                 files: Vec::new(),
+                child_groups: Vec::new(),
             });
             groups.len() - 1
         }
@@ -1584,6 +1749,7 @@ fn sort_groups(groups: &mut [MediaGroup]) {
     groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     for group in groups {
         group.source_keys.sort();
+        sort_groups(&mut group.child_groups);
         group.files.sort_by(|a, b| {
             let season_cmp = a.season_number.cmp(&b.season_number);
             if season_cmp != std::cmp::Ordering::Equal {
@@ -1769,6 +1935,47 @@ mod tests {
         assert_eq!(parsed.season_number, Some(1));
         assert_eq!(parsed.episode_number, Some(1));
         assert_eq!(parsed.source.as_deref(), Some("WEBRip"));
+    }
+
+    #[test]
+    fn parses_seed_raws_monogatari_episode_name() {
+        let parsed = parse_name("[Seed-Raws] Bakemonogatari - 01 (BD 1280x720 AVC AACx2).mp4");
+
+        assert_eq!(parsed.release_group.as_deref(), Some("Seed-Raws"));
+        assert_eq!(parsed.title_guess, "Bakemonogatari");
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(
+            infer_series_family_title(&parsed.title_guess).as_deref(),
+            Some("Monogatari")
+        );
+    }
+
+    #[test]
+    fn normalizes_case_and_strips_video_technical_suffix() {
+        assert_eq!(normalize_series_title("kara no kyoukai"), "Kara no Kyoukai");
+        assert_eq!(
+            normalize_series_title("Kara no Kyoukai - BD-BOX Disc8 Remix (BD 12"),
+            "Kara no Kyoukai"
+        );
+    }
+
+    #[test]
+    fn groups_monogatari_titles_under_family() {
+        let mut file = resource_variant("Bakemonogatari - 01.mkv");
+        file.file_size = 10;
+        file.video_codec = Some("H.264".to_string());
+        file.series_title = Some("Bakemonogatari".to_string());
+        file.series_source = Some("filename".to_string());
+
+        let mut groups = Vec::new();
+        push_video_file_into_series_group(&mut groups, file, &HashMap::new());
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Monogatari");
+        assert_eq!(groups[0].file_count, 1);
+        assert_eq!(groups[0].child_groups.len(), 1);
+        assert_eq!(groups[0].child_groups[0].name, "Bakemonogatari");
     }
 
     #[test]

@@ -433,6 +433,22 @@ button.primary {
   max-width: 100%;
 }
 
+.child-group-list {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--surface-alt);
+  padding: 12px;
+}
+
+.nested-group {
+  box-shadow: none;
+}
+
+.nested-group summary {
+  background: var(--surface);
+}
+
 .merge-form {
   display: flex;
   align-items: end;

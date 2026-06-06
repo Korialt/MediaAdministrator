@@ -70,7 +70,8 @@ function groupMatches(group: MediaGroup, query: string): boolean {
   if (group.name.toLowerCase().includes(text)) return true;
   if (group.subtitle?.toLowerCase().includes(text)) return true;
   if (group.sourceKeys.some((key) => key.toLowerCase().includes(text))) return true;
-  return group.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text));
+  if (group.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text))) return true;
+  return group.childGroups.some((child) => groupMatches(child, query));
 }
 
 function fileSpec(file: ResourceVariant): string {
@@ -178,21 +179,31 @@ function MergeControls({ group, mergeKind, onMerge }: { group: MediaGroup; merge
   );
 }
 
-function GroupItem({ group, mode, mergeKind, onMerge }: { group: MediaGroup; mode: ViewMode; mergeKind: MergeKind; onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void> }) {
+function GroupItem({ group, mode, mergeKind, onMerge, nested = false }: { group: MediaGroup; mode: ViewMode; mergeKind: MergeKind; onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void>; nested?: boolean }) {
+  const hasChildren = group.childGroups.length > 0;
+
   return (
-    <details className={mode === "grid" ? "directory-card" : "directory-row"}>
+    <details className={`${mode === "grid" && !nested ? "directory-card" : "directory-row"}${nested ? " nested-group" : ""}`}>
       <summary>
         <div className="directory-main">
           <strong>{group.name}</strong>
           {group.subtitle ? <span>{group.subtitle}</span> : null}
-          <code title={group.sourceKeys.join("\n")}>{group.sourceKeys.length} 个识别来源</code>
+          <code title={group.sourceKeys.join("\n")}>{hasChildren ? `${group.childGroups.length} 个子系列` : `${group.sourceKeys.length} 个识别来源`}</code>
         </div>
         <b>
           {group.fileCount} 个文件 · {formatBytes(group.totalSize)}
         </b>
       </summary>
       <MergeControls group={group} mergeKind={mergeKind} onMerge={onMerge} />
-      <FileRows files={group.files} />
+      {hasChildren ? (
+        <div className="child-group-list">
+          {group.childGroups.map((child) => (
+            <GroupItem group={child} key={child.key} mode="list" mergeKind={mergeKind} onMerge={onMerge} nested />
+          ))}
+        </div>
+      ) : (
+        <FileRows files={group.files} />
+      )}
     </details>
   );
 }
