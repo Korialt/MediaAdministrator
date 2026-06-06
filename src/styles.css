@@ -1,0 +1,281 @@
+:root {
+  font-family:
+    Inter, "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  color: #172026;
+  background: #f6f8fa;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 960px;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 1px solid #c8d2d8;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #172026;
+  cursor: pointer;
+  padding: 10px 14px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+button.primary {
+  background: #147d7f;
+  border-color: #147d7f;
+  color: #ffffff;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  border-right: 1px solid #dce3e7;
+  background: #eef3f5;
+  padding: 22px;
+}
+
+.brand h1,
+.toolbar h2 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: 0;
+}
+
+.brand p,
+.toolbar p {
+  margin: 4px 0 0;
+  color: #61707a;
+}
+
+.panel {
+  display: grid;
+  gap: 12px;
+}
+
+.panel-title {
+  color: #43525b;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.path-list {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.path-chip {
+  overflow: hidden;
+  border: 1px solid #d4dde2;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #314048;
+  padding: 9px 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.button-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.stats div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid #d4dde2;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 10px 12px;
+}
+
+.stats span {
+  font-weight: 700;
+}
+
+.stats small,
+.muted {
+  color: #6a7881;
+}
+
+.status {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.content {
+  min-width: 0;
+  padding: 24px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 18px;
+}
+
+.toolbar input {
+  width: min(420px, 45vw);
+  border: 1px solid #c8d2d8;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 11px 12px;
+}
+
+.library-list {
+  display: grid;
+  gap: 12px;
+}
+
+.empty {
+  border: 1px dashed #b8c5cc;
+  border-radius: 8px;
+  color: #61707a;
+  padding: 36px;
+  text-align: center;
+}
+
+.media-group {
+  border: 1px solid #d4dde2;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.media-group summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  cursor: pointer;
+  list-style: none;
+  padding: 16px 18px;
+}
+
+.media-group summary::-webkit-details-marker {
+  display: none;
+}
+
+.media-group summary div {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.media-group summary strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-group summary span,
+.media-group summary b {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #e7f2f1;
+  color: #147d7f;
+  font-size: 13px;
+  padding: 4px 8px;
+}
+
+.variant-table-wrap {
+  border-top: 1px solid #e0e7eb;
+  overflow: auto;
+}
+
+.variant-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 920px;
+}
+
+.variant-table th,
+.variant-table td {
+  border-bottom: 1px solid #edf1f3;
+  padding: 12px 14px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.variant-table th {
+  background: #f8fafb;
+  color: #4e5c65;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.variant-name {
+  font-weight: 700;
+}
+
+code {
+  display: inline-block;
+  max-width: 560px;
+  overflow: hidden;
+  color: #1f363d;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 1050px) {
+  body {
+    min-width: 0;
+  }
+
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #dce3e7;
+  }
+
+  .toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar input {
+    width: 100%;
+  }
+}
