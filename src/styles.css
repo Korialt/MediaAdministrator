@@ -17,6 +17,7 @@
   --accent: #147d7f;
   --accent-soft: #e7f2f1;
   --accent-text: #0e6668;
+  --danger: #b42318;
   --code: #1f363d;
   --shadow: 0 10px 24px rgb(20 31 38 / 0.06);
 }
@@ -34,6 +35,7 @@
   --accent: #36aeb0;
   --accent-soft: #12383a;
   --accent-text: #95e5e1;
+  --danger: #ff6b5f;
   --code: #cce0e5;
   --shadow: 0 12px 30px rgb(0 0 0 / 0.28);
 }
@@ -71,6 +73,12 @@ button:disabled {
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
+  color: #ffffff;
+}
+
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
   color: #ffffff;
 }
 

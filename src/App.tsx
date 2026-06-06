@@ -314,6 +314,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("正在检查 ffprobe...");
   const [isScanning, setIsScanning] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
@@ -359,6 +360,7 @@ export default function App() {
       setLastScan(summary);
       setLibrary(summary.library);
       setIsScanning(false);
+      setIsStopping(false);
       setScanProgress({
         phase: "processing",
         discoveredFiles: summary.scannedFiles,
@@ -378,7 +380,9 @@ export default function App() {
 
     listen<string>("scan-error", (event) => {
       setIsScanning(false);
+      setIsStopping(false);
       setStatus(String(event.payload));
+      refreshLibrary().catch((error) => setStatus(String(error)));
     }).then((unlisten) => {
       if (disposed) unlisten();
       else unlistenError = unlisten;
@@ -423,6 +427,7 @@ export default function App() {
   async function scan() {
     if (paths.length === 0) return;
     setIsScanning(true);
+    setIsStopping(false);
     setScanProgress({
       phase: "discovering",
       discoveredFiles: 0,
@@ -440,6 +445,17 @@ export default function App() {
     } catch (error) {
       setStatus(String(error));
       setIsScanning(false);
+    }
+  }
+
+  async function stopScan() {
+    setIsStopping(true);
+    setStatus("正在停止扫描...");
+    try {
+      await invoke<void>("stop_scan");
+    } catch (error) {
+      setIsStopping(false);
+      setStatus(String(error));
     }
   }
 
@@ -526,9 +542,15 @@ export default function App() {
             <button type="button" onClick={chooseDirectories}>
               选择目录
             </button>
-            <button type="button" className="primary" disabled={paths.length === 0 || isScanning} onClick={scan}>
-              {isScanning ? "扫描中" : "扫描"}
-            </button>
+            {isScanning ? (
+              <button type="button" className="danger" disabled={isStopping} onClick={stopScan}>
+                停止
+              </button>
+            ) : (
+              <button type="button" className="primary" disabled={paths.length === 0} onClick={scan}>
+                扫描
+              </button>
+            )}
           </div>
 
           <div className="exclude-header">

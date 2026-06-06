@@ -1,6 +1,6 @@
 [package]
 name = "media-administrator"
-version = "0.3.7"
+version = "0.3.8"
 description = "Local media resource administrator"
 authors = ["Media Administrator"]
 edition = "2021"

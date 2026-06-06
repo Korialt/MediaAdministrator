@@ -1,21 +1,28 @@
 use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
-    sync::Mutex,
+    process::{Command, Output, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{webview::PageLoadEvent, AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 
 struct DbState {
     conn: Mutex<Connection>,
     db_path: PathBuf,
     scan_running: Mutex<bool>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -172,6 +179,7 @@ struct AnalyzedFile {
 enum AnalyzeSkip {
     Other,
     ShortVideo,
+    Stopped,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,10 +217,72 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 ];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape"];
 const MIN_VIDEO_SECONDS: f64 = 300.0;
+const SCAN_STOPPED_MESSAGE: &str = "扫描已停止";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn ffprobe_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("ffprobe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("ffprobe")
+    }
+}
+
+fn command_output(
+    command: &mut Command,
+    stop_requested: Option<&AtomicBool>,
+) -> Result<Output, String> {
+    if let Some(stop_requested) = stop_requested {
+        if stop_requested.load(Ordering::SeqCst) {
+            return Err(SCAN_STOPPED_MESSAGE.to_string());
+        }
+    } else {
+        return command.output().map_err(|error| error.to_string());
+    }
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+
+    loop {
+        if let Some(stop_requested) = stop_requested {
+            if stop_requested.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SCAN_STOPPED_MESSAGE.to_string());
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error.to_string());
+            }
+        }
+    }
+}
+
+fn ensure_scan_not_stopped(stop_requested: &AtomicBool) -> Result<(), String> {
+    if stop_requested.load(Ordering::SeqCst) {
+        Err(SCAN_STOPPED_MESSAGE.to_string())
+    } else {
+        Ok(())
+    }
+}
 
 #[tauri::command]
 fn check_ffprobe() -> Result<String, String> {
-    match Command::new("ffprobe").arg("-version").output() {
+    let mut command = ffprobe_command();
+    command.arg("-version");
+    match command_output(&mut command, None) {
         Ok(output) if output.status.success() => Ok("ffprobe 已从 PATH 找到".to_string()),
         Ok(_) => Err("ffprobe 可执行文件存在，但版本检查失败".to_string()),
         Err(error) => Err(format!("未能从 PATH 调用 ffprobe：{error}")),
@@ -241,11 +311,19 @@ fn start_scan(
         *running = true;
     }
 
+    db.stop_requested.store(false, Ordering::SeqCst);
     let db_path = db.db_path.clone();
     let app_handle = app.clone();
     let excluded_paths = excluded_paths.unwrap_or_default();
+    let stop_requested = Arc::clone(&db.stop_requested);
     tauri::async_runtime::spawn_blocking(move || {
-        let result = run_scan(paths, excluded_paths, &db_path, Some(&app_handle));
+        let result = run_scan(
+            paths,
+            excluded_paths,
+            &db_path,
+            &stop_requested,
+            Some(&app_handle),
+        );
         match result {
             Ok(summary) => {
                 let _ = app_handle.emit("scan-complete", summary);
@@ -257,6 +335,7 @@ fn start_scan(
 
         {
             let state = app_handle.state::<DbState>();
+            state.stop_requested.store(false, Ordering::SeqCst);
             if let Ok(mut running) = state.scan_running.lock() {
                 *running = false;
             };
@@ -266,13 +345,27 @@ fn start_scan(
     Ok(())
 }
 
+#[tauri::command]
+fn stop_scan(db: State<'_, DbState>) -> Result<(), String> {
+    db.stop_requested.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 fn run_scan(
     paths: Vec<String>,
     excluded_paths: Vec<String>,
     db_path: &Path,
+    stop_requested: &AtomicBool,
     app: Option<&AppHandle>,
 ) -> Result<ScanSummary, String> {
-    let ffprobe_missing = Command::new("ffprobe").arg("-version").output().is_err();
+    ensure_scan_not_stopped(stop_requested)?;
+    let mut version_command = ffprobe_command();
+    version_command.arg("-version");
+    let ffprobe_missing = match command_output(&mut version_command, Some(stop_requested)) {
+        Ok(_) => false,
+        Err(error) if error == SCAN_STOPPED_MESSAGE => return Err(error),
+        Err(_) => true,
+    };
     let roots_for_cleanup = paths.clone();
     let excluded_roots = build_excluded_roots(&excluded_paths);
     let mut discovered_files = 0;
@@ -299,6 +392,7 @@ fn run_scan(
     );
 
     for root in paths {
+        ensure_scan_not_stopped(stop_requested)?;
         let root_path = PathBuf::from(&root);
         if !root_path.exists() {
             skipped_files += 1;
@@ -325,6 +419,7 @@ fn run_scan(
             .filter_entry(|entry| !is_excluded_path(entry.path(), &excluded_roots));
 
         for entry in walker {
+            ensure_scan_not_stopped(stop_requested)?;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -358,9 +453,11 @@ fn run_scan(
     }
 
     let total_files = media_files.len();
-    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    ensure_scan_not_stopped(stop_requested)?;
+    let mut conn = Connection::open(db_path).map_err(|error| error.to_string())?;
     init_schema(&conn).map_err(|error| error.to_string())?;
-    delete_roots(&conn, &roots_for_cleanup)?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    delete_roots(&tx, &roots_for_cleanup)?;
     maybe_emit_scan_progress(
         app,
         "processing",
@@ -377,10 +474,11 @@ fn run_scan(
     );
 
     for (path, root_path) in media_files {
+        ensure_scan_not_stopped(stop_requested)?;
         processed_files += 1;
-        match analyze_file(&path, &root_path, !ffprobe_missing) {
+        match analyze_file(&path, &root_path, !ffprobe_missing, stop_requested) {
             Ok(file) => {
-                upsert_file(&conn, &file)?;
+                upsert_file(&tx, &file)?;
                 imported_files += 1;
             }
             Err(AnalyzeSkip::ShortVideo) => {
@@ -390,6 +488,7 @@ fn run_scan(
             Err(AnalyzeSkip::Other) => {
                 skipped_files += 1;
             }
+            Err(AnalyzeSkip::Stopped) => return Err(SCAN_STOPPED_MESSAGE.to_string()),
         }
 
         maybe_emit_scan_progress(
@@ -423,6 +522,8 @@ fn run_scan(
         true,
     );
 
+    ensure_scan_not_stopped(stop_requested)?;
+    tx.commit().map_err(|error| error.to_string())?;
     let library = load_library(&conn)?;
     let recorded_directories = library.music_directories.len() + library.video_directories.len();
 
@@ -537,7 +638,12 @@ fn analyze_file(
     path: &Path,
     root_path: &Path,
     use_ffprobe: bool,
+    stop_requested: &AtomicBool,
 ) -> Result<AnalyzedFile, AnalyzeSkip> {
+    if stop_requested.load(Ordering::SeqCst) {
+        return Err(AnalyzeSkip::Stopped);
+    }
+
     let metadata = fs::metadata(path).map_err(|_| AnalyzeSkip::Other)?;
     let file_name = path
         .file_name()
@@ -546,7 +652,13 @@ fn analyze_file(
         .to_string();
     let parsed = parse_name(&file_name);
     let probe = if use_ffprobe {
-        probe_media(path).map_err(|_| AnalyzeSkip::Other)?
+        probe_media(path, stop_requested).map_err(|error| {
+            if error == SCAN_STOPPED_MESSAGE {
+                AnalyzeSkip::Stopped
+            } else {
+                AnalyzeSkip::Other
+            }
+        })?
     } else {
         return Err(AnalyzeSkip::Other);
     };
@@ -625,8 +737,9 @@ fn is_short_video(probe: &MediaProbe) -> bool {
             .unwrap_or(false)
 }
 
-fn probe_media(path: &Path) -> Result<MediaProbe, String> {
-    let output = Command::new("ffprobe")
+fn probe_media(path: &Path, stop_requested: &AtomicBool) -> Result<MediaProbe, String> {
+    let mut command = ffprobe_command();
+    command
         .args([
             "-v",
             "quiet",
@@ -635,9 +748,8 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
             "-show_format",
             "-show_streams",
         ])
-        .arg(path)
-        .output()
-        .map_err(|error| error.to_string())?;
+        .arg(path);
+    let output = command_output(&mut command, Some(stop_requested))?;
 
     if !output.status.success() {
         return Err("ffprobe 分析失败".to_string());
@@ -1929,6 +2041,7 @@ fn setup_database(app: &tauri::AppHandle) -> Result<DbState, Box<dyn std::error:
         conn: Mutex::new(conn),
         db_path,
         scan_running: Mutex::new(false),
+        stop_requested: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -2101,6 +2214,13 @@ mod tests {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_page_load(|webview, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let window = webview.window();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        })
         .setup(|app| {
             let db = setup_database(app.handle())?;
             app.manage(db);
@@ -2110,7 +2230,8 @@ pub fn run() {
             check_ffprobe,
             start_scan,
             list_library,
-            set_merge_rules
+            set_merge_rules,
+            stop_scan
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
