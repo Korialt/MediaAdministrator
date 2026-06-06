@@ -3,11 +3,12 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
-import type { LibraryData, LibraryModule, MediaDirectory, ResourceVariant, ScanProgress, ScanSummary } from "./types";
+import type { LibraryData, MediaDirectory, ResourceVariant, ScanProgress, ScanSummary } from "./types";
 
-const EMPTY_LIBRARY: LibraryData = { modules: [] };
+const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [] };
 
 type Theme = "light" | "dark";
+type ViewMode = "list" | "grid";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "-";
@@ -50,19 +51,22 @@ function progressPercent(progress: ScanProgress | null): number | null {
   return Math.min(100, Math.round((progress.processedFiles / progress.totalFiles) * 100));
 }
 
-function moduleMatches(module: LibraryModule, query: string): boolean {
+function directoryMatches(directory: MediaDirectory, query: string): boolean {
   const text = query.trim().toLowerCase();
   if (!text) return true;
-  if (module.title.toLowerCase().includes(text)) return true;
-  return module.directories.some((directory) => {
-    if (directory.name.toLowerCase().includes(text) || directory.path.toLowerCase().includes(text)) return true;
-    return directory.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text));
-  });
+  if (directory.name.toLowerCase().includes(text)) return true;
+  if (directory.relativePath.toLowerCase().includes(text)) return true;
+  if (directory.path.toLowerCase().includes(text)) return true;
+  return directory.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text));
 }
 
 function fileSpec(file: ResourceVariant): string {
   const parts = [file.resolution, file.videoCodec, file.audioCodec].filter(Boolean);
   return parts.length > 0 ? parts.join(" / ") : file.container ?? "-";
+}
+
+function directoryTitle(directory: MediaDirectory): string {
+  return directory.relativePath || directory.name;
 }
 
 function FileRows({ files }: { files: ResourceVariant[] }) {
@@ -101,12 +105,12 @@ function FileRows({ files }: { files: ResourceVariant[] }) {
   );
 }
 
-function DirectoryBlock({ directory }: { directory: MediaDirectory }) {
+function DirectoryItem({ directory, mode }: { directory: MediaDirectory; mode: ViewMode }) {
   return (
-    <details className="directory-block">
+    <details className={mode === "grid" ? "directory-card" : "directory-row"}>
       <summary>
         <div className="directory-main">
-          <strong>{directory.name}</strong>
+          <strong>{directoryTitle(directory)}</strong>
           {directory.parentName ? <span>{directory.parentName}</span> : null}
           <code title={directory.path}>{directory.path}</code>
         </div>
@@ -119,35 +123,29 @@ function DirectoryBlock({ directory }: { directory: MediaDirectory }) {
   );
 }
 
-function ModuleList({ title, emptyText, modules }: { title: string; emptyText: string; modules: LibraryModule[] }) {
+function DirectorySection({
+  title,
+  emptyText,
+  directories,
+  mode,
+}: {
+  title: string;
+  emptyText: string;
+  directories: MediaDirectory[];
+  mode: ViewMode;
+}) {
   return (
     <section className="library-section">
       <header className="section-header">
         <h3>{title}</h3>
-        <span>{modules.length} 个模块</span>
+        <span>{directories.length} 个目录</span>
       </header>
 
-      {modules.length === 0 ? <div className="empty">{emptyText}</div> : null}
+      {directories.length === 0 ? <div className="empty">{emptyText}</div> : null}
 
-      <div className="module-list">
-        {modules.map((module) => (
-          <details className="module-block" key={module.key}>
-            <summary>
-              <div>
-                <strong>{module.title}</strong>
-                <span>{module.kind === "music" ? "音乐作者" : "影视模块"}</span>
-              </div>
-              <b>
-                {module.directoryCount} 个目录 · {module.fileCount} 个文件 · {formatBytes(module.totalSize)}
-              </b>
-            </summary>
-
-            <div className="directory-list">
-              {module.directories.map((directory) => (
-                <DirectoryBlock directory={directory} key={directory.key} />
-              ))}
-            </div>
-          </details>
+      <div className={mode === "grid" ? "directory-grid" : "directory-list"}>
+        {directories.map((directory) => (
+          <DirectoryItem directory={directory} key={directory.key} mode={mode} />
         ))}
       </div>
     </section>
@@ -163,6 +161,7 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+  const [viewMode, setViewMode] = useState<ViewMode>("list");
 
   async function refreshLibrary() {
     const data = await invoke<LibraryData>("list_library");
@@ -269,15 +268,25 @@ export default function App() {
     }
   }
 
-  const filteredModules = useMemo(() => library.modules.filter((module) => moduleMatches(module, query)), [library, query]);
-  const musicModules = useMemo(() => filteredModules.filter((module) => module.kind === "music"), [filteredModules]);
-  const videoModules = useMemo(() => filteredModules.filter((module) => module.kind === "video"), [filteredModules]);
+  const musicDirectories = useMemo(
+    () => library.musicDirectories.filter((directory) => directoryMatches(directory, query)),
+    [library, query],
+  );
+  const videoDirectories = useMemo(
+    () => library.videoDirectories.filter((directory) => directoryMatches(directory, query)),
+    [library, query],
+  );
 
   const totals = useMemo(() => {
-    const directories = library.modules.reduce((sum, module) => sum + module.directoryCount, 0);
-    const files = library.modules.reduce((sum, module) => sum + module.fileCount, 0);
-    const bytes = library.modules.reduce((sum, module) => sum + module.totalSize, 0);
-    return { modules: library.modules.length, directories, files, bytes };
+    const musicFiles = library.musicDirectories.reduce((sum, directory) => sum + directory.fileCount, 0);
+    const videoFiles = library.videoDirectories.reduce((sum, directory) => sum + directory.fileCount, 0);
+    const bytes = [...library.musicDirectories, ...library.videoDirectories].reduce((sum, directory) => sum + directory.totalSize, 0);
+    return {
+      musicDirectories: library.musicDirectories.length,
+      videoDirectories: library.videoDirectories.length,
+      files: musicFiles + videoFiles,
+      bytes,
+    };
   }, [library]);
 
   const percent = progressPercent(scanProgress);
@@ -288,7 +297,7 @@ export default function App() {
         <div className="brand">
           <div>
             <h1>Media Administrator</h1>
-            <p>目录级媒体资源索引</p>
+            <p>按所在目录管理媒体资源</p>
           </div>
           <button type="button" className="theme-toggle" onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
             {theme === "dark" ? "浅色" : "暗黑"}
@@ -317,12 +326,12 @@ export default function App() {
 
         <section className="stats">
           <div>
-            <span>{totals.modules}</span>
-            <small>模块</small>
+            <span>{totals.musicDirectories}</span>
+            <small>音乐目录</small>
           </div>
           <div>
-            <span>{totals.directories}</span>
-            <small>目录</small>
+            <span>{totals.videoDirectories}</span>
+            <small>影视目录</small>
           </div>
           <div>
             <span>{totals.files}</span>
@@ -363,18 +372,28 @@ export default function App() {
         <header className="toolbar">
           <div>
             <h2>媒体库</h2>
-            <p>按作者、影视系列和电影模块归类；展开模块查看包含它的所有目录。</p>
+            <p>音乐和影视独立显示，主条目就是所在目录，例如 OST/author1/title2。</p>
           </div>
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索模块、目录或文件路径"
-            aria-label="搜索模块、目录或文件路径"
-          />
+          <div className="toolbar-actions">
+            <div className="view-switch" aria-label="显示格式">
+              <button type="button" className={viewMode === "list" ? "active" : ""} onClick={() => setViewMode("list")}>
+                列表
+              </button>
+              <button type="button" className={viewMode === "grid" ? "active" : ""} onClick={() => setViewMode("grid")}>
+                图表
+              </button>
+            </div>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索目录或文件路径"
+              aria-label="搜索目录或文件路径"
+            />
+          </div>
         </header>
 
-        <ModuleList title="音乐作者" emptyText="暂无音乐作者。" modules={musicModules} />
-        <ModuleList title="影视 / 番剧 / 电影" emptyText="暂无影视模块。" modules={videoModules} />
+        <DirectorySection title="音乐目录" emptyText="暂无音乐目录。" directories={musicDirectories} mode={viewMode} />
+        <DirectorySection title="影视目录" emptyText="暂无影视目录。" directories={videoDirectories} mode={viewMode} />
       </section>
     </main>
   );

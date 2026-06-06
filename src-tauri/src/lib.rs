@@ -46,6 +46,7 @@ struct MediaDirectory {
     key: String,
     path: String,
     name: String,
+    relative_path: String,
     parent_name: Option<String>,
     file_count: usize,
     total_size: i64,
@@ -54,20 +55,9 @@ struct MediaDirectory {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct LibraryModule {
-    key: String,
-    title: String,
-    kind: String,
-    directory_count: usize,
-    file_count: usize,
-    total_size: i64,
-    directories: Vec<MediaDirectory>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct LibraryData {
-    modules: Vec<LibraryModule>,
+    music_directories: Vec<MediaDirectory>,
+    video_directories: Vec<MediaDirectory>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -373,11 +363,7 @@ fn run_scan(
     );
 
     let library = load_library(&conn)?;
-    let recorded_directories = library
-        .modules
-        .iter()
-        .map(|module| module.directory_count)
-        .sum();
+    let recorded_directories = library.music_directories.len() + library.video_directories.len();
 
     Ok(ScanSummary {
         scanned_files: processed_files,
@@ -891,165 +877,108 @@ fn load_library(conn: &Connection) -> Result<LibraryData, String> {
         })
         .map_err(|error| error.to_string())?;
 
-    let mut modules: Vec<LibraryModule> = Vec::new();
+    let mut music_directories: Vec<MediaDirectory> = Vec::new();
+    let mut video_directories: Vec<MediaDirectory> = Vec::new();
+
     for row in rows {
         let file = row.map_err(|error| error.to_string())?;
-        let dir_path = Path::new(&file.path)
-            .parent()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| file.root_path.clone());
-        let dir_name = Path::new(&dir_path)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("根目录")
-            .to_string();
-        let parent_name = Path::new(&dir_path)
-            .parent()
-            .and_then(|path| path.file_name())
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_string());
-        let kind = file.media_kind.clone();
-        let module_title =
-            module_title_for_file(&file, &dir_path, &dir_name, parent_name.as_deref());
-        let module_key = format!("{}:{}", kind, normalize_key(&module_title));
-
-        let module_index = match modules.iter().position(|module| module.key == module_key) {
-            Some(index) => index,
-            None => {
-                modules.push(LibraryModule {
-                    key: module_key.clone(),
-                    title: module_title,
-                    kind: kind.clone(),
-                    directory_count: 0,
-                    file_count: 0,
-                    total_size: 0,
-                    directories: Vec::new(),
-                });
-                modules.len() - 1
-            }
-        };
-
-        let module = &mut modules[module_index];
-        module.file_count += 1;
-        module.total_size += file.file_size;
-
-        let directory_index = match module
-            .directories
-            .iter()
-            .position(|directory| directory.key == dir_path)
-        {
-            Some(index) => index,
-            None => {
-                module.directories.push(MediaDirectory {
-                    key: dir_path.clone(),
-                    path: dir_path.clone(),
-                    name: dir_name,
-                    parent_name,
-                    file_count: 0,
-                    total_size: 0,
-                    files: Vec::new(),
-                });
-                module.directory_count += 1;
-                module.directories.len() - 1
-            }
-        };
-
-        let directory = &mut module.directories[directory_index];
-        directory.file_count += 1;
-        directory.total_size += file.file_size;
-        directory.files.push(file);
-    }
-
-    for module in &mut modules {
-        module
-            .directories
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        for directory in &mut module.directories {
-            directory.files.sort_by(|a, b| {
-                let season_cmp = a.season_number.cmp(&b.season_number);
-                if season_cmp != std::cmp::Ordering::Equal {
-                    return season_cmp;
-                }
-                let episode_cmp = a.episode_number.cmp(&b.episode_number);
-                if episode_cmp != std::cmp::Ordering::Equal {
-                    return episode_cmp;
-                }
-                a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase())
-            });
-        }
-    }
-
-    modules.sort_by(|a, b| {
-        let kind_cmp = a.kind.cmp(&b.kind);
-        if kind_cmp != std::cmp::Ordering::Equal {
-            return kind_cmp;
-        }
-        a.title.to_lowercase().cmp(&b.title.to_lowercase())
-    });
-
-    Ok(LibraryData { modules })
-}
-
-fn module_title_for_file(
-    file: &ResourceVariant,
-    dir_path: &str,
-    dir_name: &str,
-    parent_name: Option<&str>,
-) -> String {
-    if file.media_kind == "music" {
-        return music_artist_guess(&file.root_path, dir_path, dir_name, parent_name);
-    }
-
-    if is_generic_title(&file.title_guess) {
-        let dir_title = clean_title(dir_name);
-        if is_generic_title(&dir_title) {
-            parent_name.map(clean_title).unwrap_or(dir_title)
+        let directory = if file.media_kind == "music" {
+            &mut music_directories
         } else {
-            dir_title
-        }
-    } else {
-        file.title_guess.clone()
+            &mut video_directories
+        };
+        push_file_into_directory(directory, file);
     }
+
+    sort_directories(&mut music_directories);
+    sort_directories(&mut video_directories);
+
+    Ok(LibraryData {
+        music_directories,
+        video_directories,
+    })
 }
 
-fn music_artist_guess(
-    root_path: &str,
-    dir_path: &str,
-    dir_name: &str,
-    parent_name: Option<&str>,
-) -> String {
+fn push_file_into_directory(directories: &mut Vec<MediaDirectory>, file: ResourceVariant) {
+    let dir_path = Path::new(&file.path)
+        .parent()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| file.root_path.clone());
+
+    let dir_name = Path::new(&dir_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("根目录")
+        .to_string();
+    let parent_name = Path::new(&dir_path)
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string());
+    let relative_path = relative_directory_path(&file.root_path, &dir_path);
+
+    let directory_index = match directories
+        .iter()
+        .position(|directory| directory.key == dir_path)
+    {
+        Some(index) => index,
+        None => {
+            directories.push(MediaDirectory {
+                key: dir_path.clone(),
+                path: dir_path.clone(),
+                name: dir_name,
+                relative_path,
+                parent_name,
+                file_count: 0,
+                total_size: 0,
+                files: Vec::new(),
+            });
+            directories.len() - 1
+        }
+    };
+
+    let directory = &mut directories[directory_index];
+    directory.file_count += 1;
+    directory.total_size += file.file_size;
+    directory.files.push(file);
+}
+
+fn relative_directory_path(root_path: &str, dir_path: &str) -> String {
     let root = Path::new(root_path);
     let dir = Path::new(dir_path);
     if let Ok(relative) = dir.strip_prefix(root) {
-        let components = relative
-            .components()
-            .filter_map(|component| component.as_os_str().to_str())
-            .collect::<Vec<_>>();
-        if let Some(first) = components.first() {
-            if !first.trim().is_empty() {
-                return clean_title(first);
-            }
+        let value = relative.to_string_lossy().replace('\\', "/");
+        if !value.trim().is_empty() {
+            return value;
         }
     }
 
-    parent_name
-        .map(clean_title)
-        .filter(|value| !is_generic_title(value))
-        .unwrap_or_else(|| clean_title(dir_name))
+    Path::new(dir_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("根目录")
+        .to_string()
 }
 
-fn is_generic_title(value: &str) -> bool {
-    let normalized = value.trim().to_lowercase();
-    if normalized.is_empty() || normalized == "未命名资源" {
-        return true;
+fn sort_directories(directories: &mut [MediaDirectory]) {
+    directories.sort_by(|a, b| {
+        a.relative_path
+            .to_lowercase()
+            .cmp(&b.relative_path.to_lowercase())
+    });
+    for directory in directories {
+        directory.files.sort_by(|a, b| {
+            let season_cmp = a.season_number.cmp(&b.season_number);
+            if season_cmp != std::cmp::Ordering::Equal {
+                return season_cmp;
+            }
+            let episode_cmp = a.episode_number.cmp(&b.episode_number);
+            if episode_cmp != std::cmp::Ordering::Equal {
+                return episode_cmp;
+            }
+            a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase())
+        });
     }
-
-    let compact = normalized.replace([' ', '.', '_', '-'], "");
-    compact.chars().all(|ch| ch.is_ascii_digit())
-        || matches!(
-            compact.as_str(),
-            "movie" | "sample" | "stream" | "bdmv" | "video" | "audio" | "extras" | "extra"
-        )
 }
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {

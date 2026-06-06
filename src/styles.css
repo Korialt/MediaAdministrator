@@ -17,7 +17,6 @@
   --accent: #147d7f;
   --accent-soft: #e7f2f1;
   --accent-text: #0e6668;
-  --danger-soft: #faece9;
   --code: #1f363d;
   --shadow: 0 10px 24px rgb(20 31 38 / 0.06);
 }
@@ -35,7 +34,6 @@
   --accent: #36aeb0;
   --accent-soft: #12383a;
   --accent-text: #95e5e1;
-  --danger-soft: #44221f;
   --code: #cce0e5;
   --shadow: 0 12px 30px rgb(0 0 0 / 0.28);
 }
@@ -248,8 +246,34 @@ button.primary {
   margin-bottom: 22px;
 }
 
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.view-switch {
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.view-switch button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 10px 12px;
+}
+
+.view-switch button.active {
+  background: var(--accent);
+  color: #ffffff;
+}
+
 .toolbar input {
-  width: min(440px, 45vw);
+  width: min(420px, 38vw);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface);
@@ -284,10 +308,15 @@ button.primary {
   font-size: 13px;
 }
 
-.module-list,
 .directory-list {
   display: grid;
   gap: 10px;
+}
+
+.directory-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
 }
 
 .empty {
@@ -298,8 +327,8 @@ button.primary {
   text-align: center;
 }
 
-.module-block,
-.directory-block {
+.directory-row,
+.directory-card {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
@@ -307,8 +336,8 @@ button.primary {
   overflow: hidden;
 }
 
-.module-block summary,
-.directory-block summary {
+.directory-row summary,
+.directory-card summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -318,29 +347,32 @@ button.primary {
   padding: 15px 16px;
 }
 
-.module-block summary::-webkit-details-marker,
-.directory-block summary::-webkit-details-marker {
+.directory-card summary {
+  align-items: flex-start;
+  flex-direction: column;
+  min-height: 150px;
+}
+
+.directory-row summary::-webkit-details-marker,
+.directory-card summary::-webkit-details-marker {
   display: none;
 }
 
-.module-block summary > div,
 .directory-main {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  display: grid;
+  gap: 8px;
   min-width: 0;
 }
 
-.module-block summary strong,
 .directory-main strong {
   overflow: hidden;
+  font-size: 16px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.module-block summary span,
 .directory-main span {
-  flex: 0 0 auto;
+  width: fit-content;
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--accent-text);
@@ -348,26 +380,20 @@ button.primary {
   padding: 4px 8px;
 }
 
-.module-block summary b,
-.directory-block summary b {
+.directory-row summary b,
+.directory-card summary b {
   flex: 0 0 auto;
   color: var(--muted);
   font-size: 13px;
   font-weight: 600;
 }
 
-.directory-list {
-  border-top: 1px solid var(--border-soft);
-  background: var(--surface-alt);
-  padding: 10px;
-}
-
-.directory-block {
-  box-shadow: none;
-}
-
 .directory-main code {
-  max-width: 520px;
+  max-width: 620px;
+}
+
+.directory-card .directory-main code {
+  max-width: 100%;
 }
 
 .file-table-wrap {
@@ -375,10 +401,18 @@ button.primary {
   overflow: auto;
 }
 
+.directory-card .file-table-wrap {
+  max-height: 360px;
+}
+
 .file-table {
   width: 100%;
   border-collapse: collapse;
   min-width: 920px;
+}
+
+.directory-card .file-table {
+  min-width: 720px;
 }
 
 .file-table th,
@@ -426,6 +460,7 @@ code {
   }
 
   .toolbar,
+  .toolbar-actions,
   .section-header {
     align-items: stretch;
     flex-direction: column;
@@ -435,13 +470,7 @@ code {
     width: 100%;
   }
 
-  .module-block summary,
-  .directory-block summary {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .directory-main {
+  .directory-row summary {
     align-items: flex-start;
     flex-direction: column;
   }

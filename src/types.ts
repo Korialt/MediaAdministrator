@@ -23,24 +23,16 @@ export type MediaDirectory = {
   key: string;
   path: string;
   name: string;
+  relativePath: string;
   parentName: string | null;
   fileCount: number;
   totalSize: number;
   files: ResourceVariant[];
 };
 
-export type LibraryModule = {
-  key: string;
-  title: string;
-  kind: "music" | "video";
-  directoryCount: number;
-  fileCount: number;
-  totalSize: number;
-  directories: MediaDirectory[];
-};
-
 export type LibraryData = {
-  modules: LibraryModule[];
+  musicDirectories: MediaDirectory[];
+  videoDirectories: MediaDirectory[];
 };
 
 export type ScanSummary = {
