@@ -331,7 +331,7 @@ export default function App() {
         <div className="brand">
           <div>
             <h1>Media Administrator</h1>
-            <p>按所在目录管理媒体资源</p>
+            <p>媒体索引</p>
           </div>
           <button type="button" className="theme-toggle" onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
             {theme === "dark" ? "浅色" : "暗黑"}
@@ -406,7 +406,7 @@ export default function App() {
         <header className="toolbar">
           <div>
             <h2>{activeEntry === "home" ? "媒体库" : activeTitle}</h2>
-            <p>{activeEntry === "home" ? "音乐和影视是两个独立入口，进入后只显示对应目录。" : "主条目就是所在目录，例如 OST/author1/title2。"}</p>
+            <p>{activeEntry === "home" ? "选择入口" : "目录资源"}</p>
           </div>
           {activeEntry !== "home" ? (
             <div className="toolbar-actions">

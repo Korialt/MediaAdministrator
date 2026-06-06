@@ -149,6 +149,12 @@ struct FfprobeStream {
     width: Option<i64>,
     height: Option<i64>,
     duration: Option<String>,
+    disposition: Option<FfprobeDisposition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeDisposition {
+    attached_pic: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +167,7 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "m4v", "ts", "m2ts", "webm", "mpg", "mpeg", "mp3",
     "flac", "m4a", "aac", "ogg", "opus", "wav", "ape",
 ];
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape"];
 const MIN_VIDEO_SECONDS: f64 = 300.0;
 
 #[tauri::command]
@@ -519,6 +526,16 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
         for stream in streams {
             match stream.codec_type.as_deref() {
                 Some("video") => {
+                    // FLAC/MP3 album art is reported by ffprobe as an attached video stream.
+                    if stream
+                        .disposition
+                        .as_ref()
+                        .and_then(|disposition| disposition.attached_pic)
+                        .unwrap_or(0)
+                        == 1
+                    {
+                        continue;
+                    }
                     probe.has_video = true;
                     if probe.video_codec.is_none() {
                         probe.video_codec = stream
@@ -771,7 +788,19 @@ fn is_media_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_audio_file_name(file_name: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 fn media_kind_for_file(file: &ResourceVariant) -> Option<String> {
+    if is_audio_file_name(&file.file_name) {
+        return file.audio_codec.as_ref().map(|_| "music".to_string());
+    }
+
     if file.video_codec.is_some() || file.width.is_some() || file.height.is_some() {
         Some("video".to_string())
     } else if file.audio_codec.is_some() {
@@ -1036,6 +1065,59 @@ fn setup_database(app: &tauri::AppHandle) -> Result<DbState, Box<dyn std::error:
         db_path,
         scan_running: Mutex::new(false),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource_variant(file_name: &str) -> ResourceVariant {
+        ResourceVariant {
+            id: 1,
+            path: file_name.to_string(),
+            file_name: file_name.to_string(),
+            root_path: String::new(),
+            file_size: 0,
+            duration_seconds: None,
+            container: None,
+            video_codec: None,
+            audio_codec: None,
+            width: None,
+            height: None,
+            resolution: None,
+            source: None,
+            release_group: None,
+            season_number: None,
+            episode_number: None,
+            title_guess: file_name.to_string(),
+            media_kind: String::new(),
+        }
+    }
+
+    #[test]
+    fn audio_extension_with_cover_art_stays_music() {
+        let mut file = resource_variant("album.flac");
+        file.audio_codec = Some("FLAC".to_string());
+        file.video_codec = Some("MJPEG".to_string());
+
+        assert_eq!(media_kind_for_file(&file).as_deref(), Some("music"));
+    }
+
+    #[test]
+    fn audio_extension_without_audio_stream_is_ignored() {
+        let mut file = resource_variant("broken.flac");
+        file.video_codec = Some("MJPEG".to_string());
+
+        assert_eq!(media_kind_for_file(&file), None);
+    }
+
+    #[test]
+    fn real_video_file_stays_video() {
+        let mut file = resource_variant("movie.mkv");
+        file.video_codec = Some("H.264".to_string());
+
+        assert_eq!(media_kind_for_file(&file).as_deref(), Some("video"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
