@@ -2,6 +2,7 @@ use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -38,6 +39,12 @@ struct ResourceVariant {
     episode_number: Option<i64>,
     title_guess: String,
     media_kind: String,
+    music_artist: Option<String>,
+    music_album: Option<String>,
+    music_title: Option<String>,
+    music_artist_source: Option<String>,
+    series_title: Option<String>,
+    series_source: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -55,9 +62,23 @@ struct MediaDirectory {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct MediaGroup {
+    key: String,
+    name: String,
+    subtitle: Option<String>,
+    file_count: usize,
+    total_size: i64,
+    source_keys: Vec<String>,
+    files: Vec<ResourceVariant>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct LibraryData {
     music_directories: Vec<MediaDirectory>,
     video_directories: Vec<MediaDirectory>,
+    music_artists: Vec<MediaGroup>,
+    video_series: Vec<MediaGroup>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -86,6 +107,14 @@ struct ScanProgress {
     ffprobe_missing: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeRequest {
+    kind: String,
+    source_keys: Vec<String>,
+    target_name: String,
+}
+
 #[derive(Debug, Default)]
 struct MediaProbe {
     duration_seconds: Option<f64>,
@@ -96,12 +125,14 @@ struct MediaProbe {
     height: Option<i64>,
     has_video: bool,
     has_audio: bool,
+    music_artist: Option<String>,
+    music_album: Option<String>,
+    music_title: Option<String>,
 }
 
 #[derive(Debug)]
 struct ParsedName {
     title_guess: String,
-    item_key: String,
     season_number: Option<i64>,
     episode_number: Option<i64>,
     source: Option<String>,
@@ -128,6 +159,12 @@ struct AnalyzedFile {
     episode_number: Option<i64>,
     title_guess: String,
     item_key: String,
+    music_artist: Option<String>,
+    music_album: Option<String>,
+    music_title: Option<String>,
+    music_artist_source: Option<String>,
+    series_title: Option<String>,
+    series_source: Option<String>,
 }
 
 #[derive(Debug)]
@@ -150,6 +187,7 @@ struct FfprobeStream {
     height: Option<i64>,
     duration: Option<String>,
     disposition: Option<FfprobeDisposition>,
+    tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +199,7 @@ struct FfprobeDisposition {
 struct FfprobeFormat {
     format_name: Option<String>,
     duration: Option<String>,
+    tags: Option<HashMap<String, String>>,
 }
 
 const MEDIA_EXTENSIONS: &[&str] = &[
@@ -430,6 +469,56 @@ fn list_library(db: State<'_, DbState>) -> Result<LibraryData, String> {
     load_library(&conn)
 }
 
+#[tauri::command]
+fn set_merge_rules(request: MergeRequest, db: State<'_, DbState>) -> Result<LibraryData, String> {
+    if !matches!(request.kind.as_str(), "music_artist" | "video_series") {
+        return Err("不支持的合并类型".to_string());
+    }
+
+    let mut source_keys: Vec<String> = Vec::new();
+    for key in request.source_keys {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() && !source_keys.iter().any(|existing| existing == trimmed) {
+            source_keys.push(trimmed.to_string());
+        }
+    }
+    if source_keys.is_empty() {
+        return Err("没有可合并的来源".to_string());
+    }
+
+    let target_name = request.target_name.trim();
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| "数据库连接被占用，稍后再试".to_string())?;
+
+    if target_name.is_empty() {
+        for source_key in source_keys {
+            conn.execute(
+                "DELETE FROM merge_rules WHERE kind = ?1 AND source_key = ?2",
+                params![&request.kind, source_key],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    } else {
+        for source_key in source_keys {
+            conn.execute(
+                r#"
+                INSERT INTO merge_rules (kind, source_key, target_name)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(kind, source_key) DO UPDATE SET
+                  target_name = excluded.target_name,
+                  updated_at = CURRENT_TIMESTAMP
+                "#,
+                params![&request.kind, source_key, target_name],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+
+    load_library(&conn)
+}
+
 fn analyze_file(
     path: &Path,
     root_path: &Path,
@@ -457,6 +546,27 @@ fn analyze_file(
     }
 
     let resolution = resolution_from_probe_or_name(probe.width, probe.height, &file_name);
+    let (music_artist, music_album, music_title, music_artist_source) =
+        if probe.has_audio && !probe.has_video {
+            infer_music_metadata(&probe, path, root_path, &file_name)
+        } else {
+            (None, None, None, None)
+        };
+    let (series_title, series_source) = if probe.has_video {
+        infer_video_series(path, root_path, &parsed)
+    } else {
+        (None, None)
+    };
+    let title_guess = if probe.has_video {
+        series_title
+            .clone()
+            .unwrap_or_else(|| parsed.title_guess.clone())
+    } else {
+        music_title
+            .clone()
+            .unwrap_or_else(|| parsed.title_guess.clone())
+    };
+    let item_key = build_item_key(&title_guess, parsed.season_number, parsed.episode_number);
     let path_string = path.to_string_lossy().to_string();
     let root_string = root_path.to_string_lossy().to_string();
     let modified_ms = metadata
@@ -482,8 +592,14 @@ fn analyze_file(
         release_group: parsed.release_group,
         season_number: parsed.season_number,
         episode_number: parsed.episode_number,
-        title_guess: parsed.title_guess,
-        item_key: parsed.item_key,
+        title_guess,
+        item_key,
+        music_artist,
+        music_album,
+        music_title,
+        music_artist_source,
+        series_title,
+        series_source,
     })
 }
 
@@ -518,8 +634,17 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
     let mut probe = MediaProbe::default();
 
     if let Some(format) = parsed.format {
+        let tags = format.tags;
         probe.container = format.format_name;
         probe.duration_seconds = format.duration.and_then(|value| value.parse::<f64>().ok());
+        if let Some(tags) = tags {
+            probe.music_artist = tag_value(
+                &tags,
+                &["album_artist", "albumartist", "artist", "composer"],
+            );
+            probe.music_album = tag_value(&tags, &["album"]);
+            probe.music_title = tag_value(&tags, &["title"]);
+        }
     }
 
     if let Some(streams) = parsed.streams {
@@ -552,6 +677,20 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
                 }
                 Some("audio") => {
                     probe.has_audio = true;
+                    if let Some(tags) = stream.tags.as_ref() {
+                        if probe.music_artist.is_none() {
+                            probe.music_artist = tag_value(
+                                tags,
+                                &["album_artist", "albumartist", "artist", "composer"],
+                            );
+                        }
+                        if probe.music_album.is_none() {
+                            probe.music_album = tag_value(tags, &["album"]);
+                        }
+                        if probe.music_title.is_none() {
+                            probe.music_title = tag_value(tags, &["title"]);
+                        }
+                    }
                     if probe.audio_codec.is_none() {
                         probe.audio_codec = stream
                             .codec_name
@@ -567,6 +706,251 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
     Ok(probe)
 }
 
+fn tag_value(tags: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+    for wanted in keys {
+        for (key, value) in tags {
+            if key.eq_ignore_ascii_case(wanted) {
+                let cleaned = clean_metadata_value(value);
+                if !cleaned.is_empty() {
+                    return Some(cleaned);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn clean_metadata_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn infer_music_metadata(
+    probe: &MediaProbe,
+    path: &Path,
+    root_path: &Path,
+    file_name: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let album = probe
+        .music_album
+        .clone()
+        .or_else(|| infer_album_from_directory(path, root_path));
+    let filename_artist_title = infer_artist_title_from_filename(file_name);
+    let title = probe
+        .music_title
+        .clone()
+        .or_else(|| {
+            filename_artist_title
+                .as_ref()
+                .map(|(_, title)| title.clone())
+        })
+        .or_else(|| infer_music_title_from_filename(file_name));
+
+    if let Some(artist) = probe.music_artist.clone().filter(|value| !value.is_empty()) {
+        return (Some(artist), album, title, Some("tag".to_string()));
+    }
+
+    if let Some(artist) = infer_artist_from_directory(path, root_path) {
+        return (Some(artist), album, title, Some("directory".to_string()));
+    }
+
+    if let Some((artist, _)) = filename_artist_title {
+        return (Some(artist), album, title, Some("filename".to_string()));
+    }
+
+    (
+        Some("未知作者".to_string()),
+        album,
+        title,
+        Some("unknown".to_string()),
+    )
+}
+
+fn infer_artist_from_directory(path: &Path, root_path: &Path) -> Option<String> {
+    let components = relative_parent_components(path, root_path);
+    let candidate = match components.len() {
+        0 => None,
+        1 => components.last(),
+        _ => components.get(components.len() - 2),
+    }?;
+    clean_group_name(candidate).filter(|value| !is_generic_music_directory(value))
+}
+
+fn infer_album_from_directory(path: &Path, root_path: &Path) -> Option<String> {
+    relative_parent_components(path, root_path)
+        .last()
+        .and_then(|value| clean_group_name(value))
+}
+
+fn infer_music_title_from_filename(file_name: &str) -> Option<String> {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name);
+    let title = clean_title(stem);
+    (title != "未命名资源").then_some(title)
+}
+
+fn infer_artist_title_from_filename(file_name: &str) -> Option<(String, String)> {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name);
+    let pattern = Regex::new(r"^\s*(.+?)\s+-\s+(.+?)\s*$").ok()?;
+    let caps = pattern.captures(stem)?;
+    let artist = clean_group_name(caps.get(1)?.as_str())?;
+    let title = clean_group_name(caps.get(2)?.as_str())?;
+    (!artist.is_empty() && !title.is_empty()).then_some((artist, title))
+}
+
+fn infer_video_series(
+    path: &Path,
+    root_path: &Path,
+    parsed: &ParsedName,
+) -> (Option<String>, Option<String>) {
+    if is_detected_title(&parsed.title_guess) {
+        return (
+            Some(parsed.title_guess.clone()),
+            Some("filename".to_string()),
+        );
+    }
+
+    if let Some(series) = infer_series_from_directory(path, root_path) {
+        return (Some(series), Some("directory".to_string()));
+    }
+
+    if parsed.title_guess != "未命名资源" {
+        return (
+            Some(parsed.title_guess.clone()),
+            Some("filename".to_string()),
+        );
+    }
+
+    (Some("未识别系列".to_string()), Some("unknown".to_string()))
+}
+
+fn infer_series_from_directory(path: &Path, root_path: &Path) -> Option<String> {
+    let components = relative_parent_components(path, root_path);
+    for component in components.iter().rev() {
+        if let Some(candidate) = clean_group_name(component) {
+            if !is_generic_video_directory(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn relative_parent_components(path: &Path, root_path: &Path) -> Vec<String> {
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    let relative = parent.strip_prefix(root_path).unwrap_or(parent);
+    relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter_map(clean_group_name)
+        .collect()
+}
+
+fn clean_group_name(value: &str) -> Option<String> {
+    let cleaned = value
+        .replace('_', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(&['-', '.', '_', ' '][..])
+        .to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn is_detected_title(value: &str) -> bool {
+    let key = normalize_key(value);
+    value != "未命名资源"
+        && key != "unknown"
+        && !key.is_empty()
+        && !key.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_generic_music_directory(value: &str) -> bool {
+    matches!(
+        normalize_key(value).as_str(),
+        "ost" | "music" | "audio" | "songs" | "soundtrack" | "soundtracks" | "cd" | "disc"
+    )
+}
+
+fn is_generic_video_directory(value: &str) -> bool {
+    let key = normalize_key(value);
+    if Regex::new(r"^s\d{1,2}$")
+        .expect("valid season directory regex")
+        .is_match(&key)
+    {
+        return true;
+    }
+
+    matches!(
+        key.as_str(),
+        "season"
+            | "season-1"
+            | "season-01"
+            | "extras"
+            | "extra"
+            | "specials"
+            | "ova"
+            | "oad"
+            | "sp"
+            | "subs"
+            | "subtitle"
+            | "subtitles"
+            | "bdmv"
+            | "stream"
+            | "video"
+            | "videos"
+            | "movie"
+            | "movies"
+    )
+}
+
+fn build_item_key(title: &str, season_number: Option<i64>, episode_number: Option<i64>) -> String {
+    let normalized_title = normalize_key(title);
+    match (season_number, episode_number) {
+        (Some(season), Some(episode)) => {
+            format!("episode:{normalized_title}:s{season:02}:e{episode:03}")
+        }
+        _ => format!("item:{normalized_title}"),
+    }
+}
+
+fn parse_bracketed_anime_name(
+    stem: &str,
+    fallback_release_group: Option<String>,
+    source: Option<String>,
+) -> Option<ParsedName> {
+    let pattern =
+        Regex::new(r"^\[([^\]]{2,40})\]\s*\[([^\]]{1,160})\]\s*\[(\d{1,4})(?:v\d+)?\]").ok()?;
+    let caps = pattern.captures(stem)?;
+    let release_group = caps
+        .get(1)
+        .map(|value| value.as_str().trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(fallback_release_group);
+    let title_guess = clean_group_name(caps.get(2)?.as_str())?;
+    let episode_number = caps.get(3)?.as_str().parse::<i64>().ok()?;
+    let season_number = Some(1);
+    let episode_number = Some(episode_number);
+    Some(ParsedName {
+        title_guess,
+        season_number,
+        episode_number,
+        source,
+        release_group,
+    })
+}
+
 fn parse_name(file_name: &str) -> ParsedName {
     let stem = Path::new(file_name)
         .file_stem()
@@ -574,6 +958,9 @@ fn parse_name(file_name: &str) -> ParsedName {
         .unwrap_or(file_name);
     let release_group = detect_release_group(stem);
     let source = detect_source(stem);
+    if let Some(parsed) = parse_bracketed_anime_name(stem, release_group.clone(), source.clone()) {
+        return parsed;
+    }
     let without_group = strip_release_group_prefix(stem);
     let season_episode = detect_season_episode(&without_group);
     let anime_episode = if season_episode.is_none() {
@@ -592,17 +979,9 @@ fn parse_name(file_name: &str) -> ParsedName {
         };
 
     let title_guess = clean_title(title_source);
-    let normalized_title = normalize_key(&title_guess);
-    let item_key = match (season_number, episode_number) {
-        (Some(season), Some(episode)) => {
-            format!("episode:{normalized_title}:s{season:02}:e{episode:03}")
-        }
-        _ => format!("item:{normalized_title}"),
-    };
 
     ParsedName {
         title_guess,
-        item_key,
         season_number,
         episode_number,
         source,
@@ -816,9 +1195,13 @@ fn upsert_file(conn: &Connection, file: &AnalyzedFile) -> Result<(), String> {
       INSERT INTO media_files (
         path, file_name, root_path, file_size, modified_ms, duration_seconds, container,
         video_codec, audio_codec, width, height, resolution, source, release_group,
-        season_number, episode_number, title_guess, item_key
+        season_number, episode_number, title_guess, item_key, music_artist, music_album,
+        music_title, music_artist_source, series_title, series_source
       )
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+      VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+        ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+      )
       ON CONFLICT(path) DO UPDATE SET
         file_name = excluded.file_name,
         root_path = excluded.root_path,
@@ -837,6 +1220,12 @@ fn upsert_file(conn: &Connection, file: &AnalyzedFile) -> Result<(), String> {
         episode_number = excluded.episode_number,
         title_guess = excluded.title_guess,
         item_key = excluded.item_key,
+        music_artist = excluded.music_artist,
+        music_album = excluded.music_album,
+        music_title = excluded.music_title,
+        music_artist_source = excluded.music_artist_source,
+        series_title = excluded.series_title,
+        series_source = excluded.series_source,
         updated_at = CURRENT_TIMESTAMP
       "#,
         params![
@@ -857,7 +1246,13 @@ fn upsert_file(conn: &Connection, file: &AnalyzedFile) -> Result<(), String> {
             file.season_number,
             file.episode_number,
             &file.title_guess,
-            &file.item_key
+            &file.item_key,
+            file.music_artist.as_deref(),
+            file.music_album.as_deref(),
+            file.music_title.as_deref(),
+            file.music_artist_source.as_deref(),
+            file.series_title.as_deref(),
+            file.series_source.as_deref()
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -876,13 +1271,16 @@ fn delete_roots(conn: &Connection, roots: &[String]) -> Result<(), String> {
 }
 
 fn load_library(conn: &Connection) -> Result<LibraryData, String> {
+    let music_artist_rules = load_merge_rules(conn, "music_artist")?;
+    let video_series_rules = load_merge_rules(conn, "video_series")?;
     let mut stmt = conn
         .prepare(
             r#"
       SELECT
         id, path, file_name, root_path, file_size, duration_seconds, container,
         video_codec, audio_codec, width, height, resolution, source, release_group,
-        season_number, episode_number, title_guess, item_key
+        season_number, episode_number, title_guess, item_key, music_artist, music_album,
+        music_title, music_artist_source, series_title, series_source
       FROM media_files
       ORDER BY root_path COLLATE NOCASE, path COLLATE NOCASE
       "#,
@@ -910,6 +1308,12 @@ fn load_library(conn: &Connection) -> Result<LibraryData, String> {
                 episode_number: row.get(15)?,
                 title_guess: row.get(16)?,
                 media_kind: String::new(),
+                music_artist: row.get(18)?,
+                music_album: row.get(19)?,
+                music_title: row.get(20)?,
+                music_artist_source: row.get(21)?,
+                series_title: row.get(22)?,
+                series_source: row.get(23)?,
             };
             file.media_kind = media_kind_for_file(&file).unwrap_or_else(|| "ignored".to_string());
             Ok(file)
@@ -918,24 +1322,180 @@ fn load_library(conn: &Connection) -> Result<LibraryData, String> {
 
     let mut music_directories: Vec<MediaDirectory> = Vec::new();
     let mut video_directories: Vec<MediaDirectory> = Vec::new();
+    let mut music_artists: Vec<MediaGroup> = Vec::new();
+    let mut video_series: Vec<MediaGroup> = Vec::new();
 
     for row in rows {
         let file = row.map_err(|error| error.to_string())?;
-        let directory = match file.media_kind.as_str() {
-            "music" => &mut music_directories,
-            "video" => &mut video_directories,
-            _ => continue,
-        };
-        push_file_into_directory(directory, file);
+        match file.media_kind.as_str() {
+            "music" => {
+                push_file_into_directory(&mut music_directories, file.clone());
+                push_music_file_into_artist_group(&mut music_artists, file, &music_artist_rules);
+            }
+            "video" => {
+                push_file_into_directory(&mut video_directories, file.clone());
+                push_video_file_into_series_group(&mut video_series, file, &video_series_rules);
+            }
+            _ => {}
+        }
     }
 
     sort_directories(&mut music_directories);
     sort_directories(&mut video_directories);
+    sort_groups(&mut music_artists);
+    sort_groups(&mut video_series);
 
     Ok(LibraryData {
         music_directories,
         video_directories,
+        music_artists,
+        video_series,
     })
+}
+
+fn load_merge_rules(conn: &Connection, kind: &str) -> Result<HashMap<String, String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT source_key, target_name FROM merge_rules WHERE kind = ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![kind], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut rules = HashMap::new();
+    for row in rows {
+        let (source_key, target_name) = row.map_err(|error| error.to_string())?;
+        rules.insert(source_key, target_name);
+    }
+    Ok(rules)
+}
+
+fn push_music_file_into_artist_group(
+    groups: &mut Vec<MediaGroup>,
+    file: ResourceVariant,
+    rules: &HashMap<String, String>,
+) {
+    let artist = file
+        .music_artist
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| infer_artist_from_directory(Path::new(&file.path), Path::new(&file.root_path)))
+        .unwrap_or_else(|| "未知作者".to_string());
+    let source_key = group_source_key("music_artist", &artist);
+    let subtitle = file
+        .music_artist_source
+        .as_deref()
+        .map(music_artist_source_label);
+    push_file_into_group(
+        groups,
+        "music_artist",
+        source_key,
+        artist,
+        subtitle,
+        file,
+        rules,
+    );
+}
+
+fn push_video_file_into_series_group(
+    groups: &mut Vec<MediaGroup>,
+    file: ResourceVariant,
+    rules: &HashMap<String, String>,
+) {
+    let series = file
+        .series_title
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            if is_detected_title(&file.title_guess) {
+                Some(file.title_guess.clone())
+            } else {
+                infer_series_from_directory(Path::new(&file.path), Path::new(&file.root_path))
+            }
+        })
+        .unwrap_or_else(|| "未识别系列".to_string());
+    let source_key = group_source_key("video_series", &series);
+    let subtitle = file.series_source.as_deref().map(series_source_label);
+    push_file_into_group(
+        groups,
+        "video_series",
+        source_key,
+        series,
+        subtitle,
+        file,
+        rules,
+    );
+}
+
+fn push_file_into_group(
+    groups: &mut Vec<MediaGroup>,
+    kind: &str,
+    source_key: String,
+    detected_name: String,
+    subtitle: Option<String>,
+    file: ResourceVariant,
+    rules: &HashMap<String, String>,
+) {
+    let display_name = rules
+        .get(&source_key)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or(detected_name);
+    let group_key = group_source_key(kind, &display_name);
+
+    let group_index = match groups.iter().position(|group| group.key == group_key) {
+        Some(index) => index,
+        None => {
+            groups.push(MediaGroup {
+                key: group_key.clone(),
+                name: display_name,
+                subtitle: subtitle.clone(),
+                file_count: 0,
+                total_size: 0,
+                source_keys: Vec::new(),
+                files: Vec::new(),
+            });
+            groups.len() - 1
+        }
+    };
+
+    let group = &mut groups[group_index];
+    if !group.source_keys.iter().any(|key| key == &source_key) {
+        group.source_keys.push(source_key);
+    }
+    if group.subtitle != subtitle {
+        group.subtitle = None;
+    }
+    group.file_count += 1;
+    group.total_size += file.file_size;
+    group.files.push(file);
+}
+
+fn group_source_key(kind: &str, name: &str) -> String {
+    let normalized = normalize_key(name);
+    if normalized.is_empty() {
+        format!("{kind}:unknown")
+    } else {
+        format!("{kind}:{normalized}")
+    }
+}
+
+fn music_artist_source_label(source: &str) -> String {
+    match source {
+        "tag" => "标签".to_string(),
+        "directory" => "目录".to_string(),
+        "filename" => "文件名".to_string(),
+        _ => "未知来源".to_string(),
+    }
+}
+
+fn series_source_label(source: &str) -> String {
+    match source {
+        "filename" => "文件名".to_string(),
+        "directory" => "目录".to_string(),
+        _ => "未知来源".to_string(),
+    }
 }
 
 fn push_file_into_directory(directories: &mut Vec<MediaDirectory>, file: ResourceVariant) {
@@ -1020,6 +1580,24 @@ fn sort_directories(directories: &mut [MediaDirectory]) {
     }
 }
 
+fn sort_groups(groups: &mut [MediaGroup]) {
+    groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    for group in groups {
+        group.source_keys.sort();
+        group.files.sort_by(|a, b| {
+            let season_cmp = a.season_number.cmp(&b.season_number);
+            if season_cmp != std::cmp::Ordering::Equal {
+                return season_cmp;
+            }
+            let episode_cmp = a.episode_number.cmp(&b.episode_number);
+            if episode_cmp != std::cmp::Ordering::Equal {
+                return episode_cmp;
+            }
+            a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase())
+        });
+    }
+}
+
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         r#"
@@ -1043,15 +1621,60 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
       episode_number INTEGER,
       title_guess TEXT NOT NULL,
       item_key TEXT NOT NULL,
+      music_artist TEXT,
+      music_album TEXT,
+      music_title TEXT,
+      music_artist_source TEXT,
+      series_title TEXT,
+      series_source TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS merge_rules (
+      kind TEXT NOT NULL,
+      source_key TEXT NOT NULL,
+      target_name TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (kind, source_key)
     );
 
     CREATE INDEX IF NOT EXISTS idx_media_files_item_key ON media_files(item_key);
     CREATE INDEX IF NOT EXISTS idx_media_files_title ON media_files(title_guess);
     CREATE INDEX IF NOT EXISTS idx_media_files_root ON media_files(root_path);
+    CREATE INDEX IF NOT EXISTS idx_merge_rules_kind ON merge_rules(kind);
     "#,
-    )
+    )?;
+
+    add_column_if_missing(conn, "media_files", "music_artist", "TEXT")?;
+    add_column_if_missing(conn, "media_files", "music_album", "TEXT")?;
+    add_column_if_missing(conn, "media_files", "music_title", "TEXT")?;
+    add_column_if_missing(conn, "media_files", "music_artist_source", "TEXT")?;
+    add_column_if_missing(conn, "media_files", "series_title", "TEXT")?;
+    add_column_if_missing(conn, "media_files", "series_source", "TEXT")?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing?.eq_ignore_ascii_case(column) {
+            return Ok(());
+        }
+    }
+
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn setup_database(app: &tauri::AppHandle) -> Result<DbState, Box<dyn std::error::Error>> {
@@ -1091,6 +1714,12 @@ mod tests {
             episode_number: None,
             title_guess: file_name.to_string(),
             media_kind: String::new(),
+            music_artist: None,
+            music_album: None,
+            music_title: None,
+            music_artist_source: None,
+            series_title: None,
+            series_source: None,
         }
     }
 
@@ -1118,6 +1747,39 @@ mod tests {
 
         assert_eq!(media_kind_for_file(&file).as_deref(), Some("video"));
     }
+
+    #[test]
+    fn parses_bracketed_anime_episode_name() {
+        let parsed = parse_name("[Nekomoe kissaten][Jigokuraku][25][1080p][JPSC].mp4");
+
+        assert_eq!(parsed.release_group.as_deref(), Some("Nekomoe kissaten"));
+        assert_eq!(parsed.title_guess, "Jigokuraku");
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(25));
+    }
+
+    #[test]
+    fn parses_release_group_title_dash_episode_name() {
+        let parsed = parse_name(
+            "[LoliHouse] Fate strange Fake - 01 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv",
+        );
+
+        assert_eq!(parsed.release_group.as_deref(), Some("LoliHouse"));
+        assert_eq!(parsed.title_guess, "Fate strange Fake");
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.source.as_deref(), Some("WEBRip"));
+    }
+
+    #[test]
+    fn parses_artist_title_from_music_filename() {
+        let parsed = infer_artist_title_from_filename("artist name - song title.flac");
+
+        assert_eq!(
+            parsed,
+            Some(("artist name".to_string(), "song title".to_string()))
+        );
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1132,7 +1794,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_ffprobe,
             start_scan,
-            list_library
+            list_library,
+            set_merge_rules
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

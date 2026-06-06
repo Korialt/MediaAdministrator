@@ -3,13 +3,16 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
-import type { LibraryData, MediaDirectory, ResourceVariant, ScanProgress, ScanSummary } from "./types";
+import type { LibraryData, MediaDirectory, MediaGroup, ResourceVariant, ScanProgress, ScanSummary } from "./types";
 
-const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [] };
+const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [], musicArtists: [], videoSeries: [] };
 
 type Theme = "light" | "dark";
 type ViewMode = "list" | "grid";
 type ActiveEntry = "home" | "music" | "video";
+type MusicBrowseMode = "directory" | "artist";
+type VideoBrowseMode = "directory" | "series";
+type MergeKind = "music_artist" | "video_series";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "-";
@@ -61,6 +64,15 @@ function directoryMatches(directory: MediaDirectory, query: string): boolean {
   return directory.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text));
 }
 
+function groupMatches(group: MediaGroup, query: string): boolean {
+  const text = query.trim().toLowerCase();
+  if (!text) return true;
+  if (group.name.toLowerCase().includes(text)) return true;
+  if (group.subtitle?.toLowerCase().includes(text)) return true;
+  if (group.sourceKeys.some((key) => key.toLowerCase().includes(text))) return true;
+  return group.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text));
+}
+
 function fileSpec(file: ResourceVariant): string {
   const parts = [file.resolution, file.videoCodec, file.audioCodec].filter(Boolean);
   return parts.length > 0 ? parts.join(" / ") : file.container ?? "-";
@@ -68,6 +80,11 @@ function fileSpec(file: ResourceVariant): string {
 
 function directoryTitle(directory: MediaDirectory): string {
   return directory.relativePath || directory.name;
+}
+
+function fileMeta(file: ResourceVariant): string {
+  const parts = [episodeLabel(file), file.releaseGroup, file.source, file.musicArtist, file.musicAlbum, file.seriesTitle].filter(Boolean);
+  return parts.join(" / ") || file.musicTitle || file.titleGuess;
 }
 
 function FileRows({ files }: { files: ResourceVariant[] }) {
@@ -88,9 +105,7 @@ function FileRows({ files }: { files: ResourceVariant[] }) {
             <tr key={file.id}>
               <td>
                 <div className="file-name">{file.fileName}</div>
-                <div className="muted">
-                  {[episodeLabel(file), file.releaseGroup, file.source].filter(Boolean).join(" / ") || file.titleGuess}
-                </div>
+                <div className="muted">{fileMeta(file)}</div>
               </td>
               <td>{fileSpec(file)}</td>
               <td>{formatBytes(file.fileSize)}</td>
@@ -124,6 +139,64 @@ function DirectoryItem({ directory, mode }: { directory: MediaDirectory; mode: V
   );
 }
 
+function MergeControls({ group, mergeKind, onMerge }: { group: MediaGroup; mergeKind: MergeKind; onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void> }) {
+  const [targetName, setTargetName] = useState(group.name);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setTargetName(group.name);
+  }, [group.key, group.name]);
+
+  async function submit(target: string) {
+    setBusy(true);
+    try {
+      await onMerge(mergeKind, group, target);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form
+      className="merge-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void submit(targetName);
+      }}
+    >
+      <label>
+        合并到
+        <input value={targetName} onChange={(event) => setTargetName(event.target.value)} placeholder="目标名称" />
+      </label>
+      <button type="submit" className="primary" disabled={busy || targetName.trim().length === 0}>
+        合并
+      </button>
+      <button type="button" disabled={busy} onClick={() => void submit("")}>
+        清除规则
+      </button>
+    </form>
+  );
+}
+
+function GroupItem({ group, mode, mergeKind, onMerge }: { group: MediaGroup; mode: ViewMode; mergeKind: MergeKind; onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void> }) {
+  return (
+    <details className={mode === "grid" ? "directory-card" : "directory-row"}>
+      <summary>
+        <div className="directory-main">
+          <strong>{group.name}</strong>
+          {group.subtitle ? <span>{group.subtitle}</span> : null}
+          <code title={group.sourceKeys.join("\n")}>{group.sourceKeys.length} 个识别来源</code>
+        </div>
+        <b>
+          {group.fileCount} 个文件 · {formatBytes(group.totalSize)}
+        </b>
+      </summary>
+      <MergeControls group={group} mergeKind={mergeKind} onMerge={onMerge} />
+      <FileRows files={group.files} />
+    </details>
+  );
+}
+
 function DirectorySection({
   title,
   emptyText,
@@ -153,17 +226,54 @@ function DirectorySection({
   );
 }
 
+function GroupSection({
+  title,
+  emptyText,
+  groups,
+  mode,
+  mergeKind,
+  onMerge,
+}: {
+  title: string;
+  emptyText: string;
+  groups: MediaGroup[];
+  mode: ViewMode;
+  mergeKind: MergeKind;
+  onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void>;
+}) {
+  return (
+    <section className="library-section">
+      <header className="section-header">
+        <h3>{title}</h3>
+        <span>{groups.length} 个分类</span>
+      </header>
+
+      {groups.length === 0 ? <div className="empty">{emptyText}</div> : null}
+
+      <div className={mode === "grid" ? "directory-grid" : "directory-list"}>
+        {groups.map((group) => (
+          <GroupItem group={group} key={group.key} mode={mode} mergeKind={mergeKind} onMerge={onMerge} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function EntryPanel({
   musicCount,
   videoCount,
   musicFiles,
   videoFiles,
+  musicArtists,
+  videoSeries,
   onSelect,
 }: {
   musicCount: number;
   videoCount: number;
   musicFiles: number;
   videoFiles: number;
+  musicArtists: number;
+  videoSeries: number;
   onSelect: (entry: ActiveEntry) => void;
 }) {
   return (
@@ -171,12 +281,16 @@ function EntryPanel({
       <button type="button" className="entry-card" onClick={() => onSelect("music")}>
         <span>音乐</span>
         <strong>{musicCount}</strong>
-        <small>{musicFiles} 个音频文件</small>
+        <small>
+          {musicFiles} 个音频文件 · {musicArtists} 位作者
+        </small>
       </button>
       <button type="button" className="entry-card" onClick={() => onSelect("video")}>
         <span>影视</span>
         <strong>{videoCount}</strong>
-        <small>{videoFiles} 个视频文件</small>
+        <small>
+          {videoFiles} 个视频文件 · {videoSeries} 个系列
+        </small>
       </button>
     </section>
   );
@@ -193,6 +307,8 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [activeEntry, setActiveEntry] = useState<ActiveEntry>("home");
+  const [musicBrowseMode, setMusicBrowseMode] = useState<MusicBrowseMode>("directory");
+  const [videoBrowseMode, setVideoBrowseMode] = useState<VideoBrowseMode>("directory");
 
   async function refreshLibrary() {
     const data = await invoke<LibraryData>("list_library");
@@ -299,6 +415,23 @@ export default function App() {
     }
   }
 
+  async function applyMerge(kind: MergeKind, group: MediaGroup, targetName: string) {
+    setStatus(targetName.trim() ? "正在保存合并规则..." : "正在清除合并规则...");
+    try {
+      const data = await invoke<LibraryData>("set_merge_rules", {
+        request: {
+          kind,
+          sourceKeys: group.sourceKeys,
+          targetName,
+        },
+      });
+      setLibrary(data);
+      setStatus(targetName.trim() ? "合并规则已保存" : "合并规则已清除");
+    } catch (error) {
+      setStatus(String(error));
+    }
+  }
+
   const musicDirectories = useMemo(
     () => library.musicDirectories.filter((directory) => directoryMatches(directory, query)),
     [library, query],
@@ -307,6 +440,8 @@ export default function App() {
     () => library.videoDirectories.filter((directory) => directoryMatches(directory, query)),
     [library, query],
   );
+  const musicArtists = useMemo(() => library.musicArtists.filter((group) => groupMatches(group, query)), [library, query]);
+  const videoSeries = useMemo(() => library.videoSeries.filter((group) => groupMatches(group, query)), [library, query]);
 
   const totals = useMemo(() => {
     const musicFiles = library.musicDirectories.reduce((sum, directory) => sum + directory.fileCount, 0);
@@ -315,15 +450,26 @@ export default function App() {
     return {
       musicDirectories: library.musicDirectories.length,
       videoDirectories: library.videoDirectories.length,
+      musicArtists: library.musicArtists.length,
+      videoSeries: library.videoSeries.length,
+      musicFiles,
+      videoFiles,
       files: musicFiles + videoFiles,
       bytes,
     };
   }, [library]);
 
   const percent = progressPercent(scanProgress);
-  const activeDirectories = activeEntry === "music" ? musicDirectories : videoDirectories;
-  const activeTitle = activeEntry === "music" ? "音乐目录" : "影视目录";
-  const activeEmptyText = activeEntry === "music" ? "暂无音乐目录。" : "暂无影视目录。";
+  const activeBrowseMode = activeEntry === "music" ? musicBrowseMode : videoBrowseMode;
+  const activeTitle =
+    activeEntry === "music"
+      ? musicBrowseMode === "directory"
+        ? "音乐目录"
+        : "音乐作者"
+      : videoBrowseMode === "directory"
+        ? "影视目录"
+        : "影视系列";
+  const activeEmptyText = activeEntry === "music" ? "暂无音乐资源。" : "暂无影视资源。";
 
   return (
     <main className="app-shell">
@@ -368,6 +514,14 @@ export default function App() {
             <small>影视目录</small>
           </div>
           <div>
+            <span>{totals.musicArtists}</span>
+            <small>作者</small>
+          </div>
+          <div>
+            <span>{totals.videoSeries}</span>
+            <small>系列</small>
+          </div>
+          <div>
             <span>{totals.files}</span>
             <small>文件</small>
           </div>
@@ -406,13 +560,34 @@ export default function App() {
         <header className="toolbar">
           <div>
             <h2>{activeEntry === "home" ? "媒体库" : activeTitle}</h2>
-            <p>{activeEntry === "home" ? "选择入口" : "目录资源"}</p>
+            <p>{activeEntry === "home" ? "选择入口" : activeBrowseMode === "directory" ? "目录资源" : "分类资源"}</p>
           </div>
           {activeEntry !== "home" ? (
             <div className="toolbar-actions">
               <button type="button" onClick={() => setActiveEntry("home")}>
                 返回入口
               </button>
+              <div className="view-switch" aria-label="分类方式">
+                {activeEntry === "music" ? (
+                  <>
+                    <button type="button" className={musicBrowseMode === "directory" ? "active" : ""} onClick={() => setMusicBrowseMode("directory")}>
+                      目录
+                    </button>
+                    <button type="button" className={musicBrowseMode === "artist" ? "active" : ""} onClick={() => setMusicBrowseMode("artist")}>
+                      作者
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button type="button" className={videoBrowseMode === "directory" ? "active" : ""} onClick={() => setVideoBrowseMode("directory")}>
+                      目录
+                    </button>
+                    <button type="button" className={videoBrowseMode === "series" ? "active" : ""} onClick={() => setVideoBrowseMode("series")}>
+                      系列
+                    </button>
+                  </>
+                )}
+              </div>
               <div className="view-switch" aria-label="显示格式">
                 <button type="button" className={viewMode === "list" ? "active" : ""} onClick={() => setViewMode("list")}>
                   列表
@@ -424,8 +599,8 @@ export default function App() {
               <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="搜索目录或文件路径"
-                aria-label="搜索目录或文件路径"
+                placeholder={activeBrowseMode === "directory" ? "搜索目录或文件路径" : "搜索分类或文件路径"}
+                aria-label="搜索"
               />
             </div>
           ) : null}
@@ -435,12 +610,23 @@ export default function App() {
           <EntryPanel
             musicCount={totals.musicDirectories}
             videoCount={totals.videoDirectories}
-            musicFiles={library.musicDirectories.reduce((sum, directory) => sum + directory.fileCount, 0)}
-            videoFiles={library.videoDirectories.reduce((sum, directory) => sum + directory.fileCount, 0)}
+            musicFiles={totals.musicFiles}
+            videoFiles={totals.videoFiles}
+            musicArtists={totals.musicArtists}
+            videoSeries={totals.videoSeries}
             onSelect={setActiveEntry}
           />
+        ) : activeEntry === "music" && musicBrowseMode === "artist" ? (
+          <GroupSection title="音乐作者" emptyText={activeEmptyText} groups={musicArtists} mode={viewMode} mergeKind="music_artist" onMerge={applyMerge} />
+        ) : activeEntry === "video" && videoBrowseMode === "series" ? (
+          <GroupSection title="影视系列" emptyText={activeEmptyText} groups={videoSeries} mode={viewMode} mergeKind="video_series" onMerge={applyMerge} />
         ) : (
-          <DirectorySection title={activeTitle} emptyText={activeEmptyText} directories={activeDirectories} mode={viewMode} />
+          <DirectorySection
+            title={activeTitle}
+            emptyText={activeEmptyText}
+            directories={activeEntry === "music" ? musicDirectories : videoDirectories}
+            mode={viewMode}
+          />
         )}
       </section>
     </main>

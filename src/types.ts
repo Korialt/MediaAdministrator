@@ -17,6 +17,12 @@ export type ResourceVariant = {
   episodeNumber: number | null;
   titleGuess: string;
   mediaKind: "music" | "video";
+  musicArtist: string | null;
+  musicAlbum: string | null;
+  musicTitle: string | null;
+  musicArtistSource: string | null;
+  seriesTitle: string | null;
+  seriesSource: string | null;
 };
 
 export type MediaDirectory = {
@@ -30,9 +36,21 @@ export type MediaDirectory = {
   files: ResourceVariant[];
 };
 
+export type MediaGroup = {
+  key: string;
+  name: string;
+  subtitle: string | null;
+  fileCount: number;
+  totalSize: number;
+  sourceKeys: string[];
+  files: ResourceVariant[];
+};
+
 export type LibraryData = {
   musicDirectories: MediaDirectory[];
   videoDirectories: MediaDirectory[];
+  musicArtists: MediaGroup[];
+  videoSeries: MediaGroup[];
 };
 
 export type ScanSummary = {
