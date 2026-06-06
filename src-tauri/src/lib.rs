@@ -220,7 +220,12 @@ fn check_ffprobe() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn start_scan(paths: Vec<String>, app: AppHandle, db: State<'_, DbState>) -> Result<(), String> {
+fn start_scan(
+    paths: Vec<String>,
+    excluded_paths: Option<Vec<String>>,
+    app: AppHandle,
+    db: State<'_, DbState>,
+) -> Result<(), String> {
     if paths.is_empty() {
         return Err("至少需要选择一个目录".to_string());
     }
@@ -238,8 +243,9 @@ fn start_scan(paths: Vec<String>, app: AppHandle, db: State<'_, DbState>) -> Res
 
     let db_path = db.db_path.clone();
     let app_handle = app.clone();
+    let excluded_paths = excluded_paths.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
-        let result = run_scan(paths, &db_path, Some(&app_handle));
+        let result = run_scan(paths, excluded_paths, &db_path, Some(&app_handle));
         match result {
             Ok(summary) => {
                 let _ = app_handle.emit("scan-complete", summary);
@@ -262,11 +268,13 @@ fn start_scan(paths: Vec<String>, app: AppHandle, db: State<'_, DbState>) -> Res
 
 fn run_scan(
     paths: Vec<String>,
+    excluded_paths: Vec<String>,
     db_path: &Path,
     app: Option<&AppHandle>,
 ) -> Result<ScanSummary, String> {
     let ffprobe_missing = Command::new("ffprobe").arg("-version").output().is_err();
     let roots_for_cleanup = paths.clone();
+    let excluded_roots = build_excluded_roots(&excluded_paths);
     let mut discovered_files = 0;
     let mut processed_files = 0;
     let mut imported_files = 0;
@@ -311,7 +319,12 @@ fn run_scan(
             continue;
         }
 
-        for entry in WalkDir::new(&root_path).follow_links(false).into_iter() {
+        let walker = WalkDir::new(&root_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_excluded_path(entry.path(), &excluded_roots));
+
+        for entry in walker {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -844,6 +857,24 @@ fn infer_series_from_directory(path: &Path, root_path: &Path) -> Option<String> 
     None
 }
 
+fn infer_series_from_file_name(file_name: &str) -> Option<String> {
+    let parsed = parse_name(file_name);
+    let title = normalize_series_title(&parsed.title_guess);
+    is_detected_title(&title).then_some(title)
+}
+
+fn should_replace_stored_series(stored_series: &str, filename_series: &str) -> bool {
+    !filename_series.trim().is_empty()
+        && normalize_key(stored_series) != normalize_key(filename_series)
+        && is_generated_directory_title(stored_series)
+}
+
+fn is_generated_directory_title(value: &str) -> bool {
+    let key = normalize_key(value);
+    let digit_count = key.chars().filter(|ch| ch.is_ascii_digit()).count();
+    !key.is_empty() && digit_count == key.len() && matches!(key.len(), 6 | 8)
+}
+
 fn relative_parent_components(path: &Path, root_path: &Path) -> Vec<String> {
     let Some(parent) = path.parent() else {
         return Vec::new();
@@ -1249,6 +1280,40 @@ fn normalize_audio_codec(codec: String) -> String {
     }
 }
 
+fn build_excluded_roots(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let trimmed = path.trim();
+            (!trimmed.is_empty()).then(|| normalized_path_string(Path::new(trimmed)))
+        })
+        .collect()
+}
+
+fn is_excluded_path(path: &Path, excluded_roots: &[String]) -> bool {
+    if excluded_roots.is_empty() {
+        return false;
+    }
+
+    let candidate = normalized_path_string(path);
+    excluded_roots.iter().any(|root| {
+        candidate == *root
+            || candidate
+                .strip_prefix(root)
+                .map(|remaining| remaining.starts_with('/'))
+                .unwrap_or(false)
+    })
+}
+
+fn normalized_path_string(path: &Path) -> String {
+    let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut value = normalized.to_string_lossy().replace('\\', "/");
+    while value.ends_with('/') && value.len() > 1 {
+        value.pop();
+    }
+    value.to_lowercase()
+}
+
 fn is_media_file(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -1492,10 +1557,21 @@ fn push_video_file_into_series_group(
     file: ResourceVariant,
     rules: &HashMap<String, String>,
 ) {
+    let filename_series = infer_series_from_file_name(&file.file_name);
     let detected_series = file
         .series_title
         .clone()
         .filter(|value| !value.trim().is_empty())
+        .map(|value| normalize_series_title(&value))
+        .and_then(|stored| {
+            if let Some(filename) = filename_series.as_deref() {
+                if should_replace_stored_series(&stored, filename) {
+                    return Some(filename.to_string());
+                }
+            }
+            Some(stored)
+        })
+        .or(filename_series)
         .or_else(|| {
             if is_detected_title(&file.title_guess) {
                 Some(normalize_series_title(&file.title_guess))
@@ -1922,6 +1998,38 @@ mod tests {
         assert_eq!(parsed.title_guess, "Jigokuraku");
         assert_eq!(parsed.season_number, Some(1));
         assert_eq!(parsed.episode_number, Some(25));
+    }
+
+    #[test]
+    fn bracketed_filename_series_replaces_date_directory_title() {
+        let mut file = resource_variant("[Nekomoe kissaten][Jigokuraku][21][1080p][JPSC].mp4");
+        file.video_codec = Some("H.264".to_string());
+        file.series_title = Some("202604".to_string());
+        file.title_guess = "202604".to_string();
+
+        let mut groups = Vec::new();
+        push_video_file_into_series_group(&mut groups, file, &HashMap::new());
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Jigokuraku");
+    }
+
+    #[test]
+    fn excluded_directory_skips_entire_subtree_only() {
+        let excluded = build_excluded_roots(&["/library/root/extras".to_string()]);
+
+        assert!(is_excluded_path(
+            Path::new("/library/root/extras"),
+            &excluded
+        ));
+        assert!(is_excluded_path(
+            Path::new("/library/root/extras/bonus/file.mkv"),
+            &excluded
+        ));
+        assert!(!is_excluded_path(
+            Path::new("/library/root/extras2/file.mkv"),
+            &excluded
+        ));
     }
 
     #[test]

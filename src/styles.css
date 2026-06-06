@@ -147,6 +147,42 @@ button.primary {
   white-space: nowrap;
 }
 
+.exclude-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--heading-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.exclude-header button {
+  padding: 7px 10px;
+}
+
+.path-list.compact {
+  max-height: 150px;
+}
+
+.path-chip.removable {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.path-chip.removable span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-chip.removable button {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+}
+
 .button-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

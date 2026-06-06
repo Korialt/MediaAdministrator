@@ -309,6 +309,7 @@ function EntryPanel({
 
 export default function App() {
   const [paths, setPaths] = useState<string[]>([]);
+  const [excludedPaths, setExcludedPaths] = useState<string[]>([]);
   const [library, setLibrary] = useState<LibraryData>(EMPTY_LIBRARY);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("正在检查 ffprobe...");
@@ -403,6 +404,22 @@ export default function App() {
     setPaths((current) => Array.from(new Set([...current, ...next])));
   }
 
+  async function chooseExcludedDirectories() {
+    const selected = await open({
+      directory: true,
+      multiple: true,
+      title: "选择排除子目录",
+    });
+
+    if (!selected) return;
+    const next = Array.isArray(selected) ? selected : [selected];
+    setExcludedPaths((current) => Array.from(new Set([...current, ...next])));
+  }
+
+  function removeExcludedPath(path: string) {
+    setExcludedPaths((current) => current.filter((item) => item !== path));
+  }
+
   async function scan() {
     if (paths.length === 0) return;
     setIsScanning(true);
@@ -419,7 +436,7 @@ export default function App() {
     });
     setStatus("后台扫描已启动...");
     try {
-      await invoke<void>("start_scan", { paths });
+      await invoke<void>("start_scan", { paths, excludedPaths });
     } catch (error) {
       setStatus(String(error));
       setIsScanning(false);
@@ -512,6 +529,24 @@ export default function App() {
             <button type="button" className="primary" disabled={paths.length === 0 || isScanning} onClick={scan}>
               {isScanning ? "扫描中" : "扫描"}
             </button>
+          </div>
+
+          <div className="exclude-header">
+            <span>排除子目录</span>
+            <button type="button" onClick={chooseExcludedDirectories}>
+              添加排除
+            </button>
+          </div>
+          <div className="path-list compact">
+            {excludedPaths.length === 0 ? <span className="muted">未设置排除目录</span> : null}
+            {excludedPaths.map((path) => (
+              <div className="path-chip removable" key={path} title={path}>
+                <span>{path}</span>
+                <button type="button" onClick={() => removeExcludedPath(path)}>
+                  移除
+                </button>
+              </div>
+            ))}
           </div>
         </section>
 
