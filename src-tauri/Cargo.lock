@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "media-administrator"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "regex",
  "rusqlite",

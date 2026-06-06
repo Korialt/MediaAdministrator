@@ -36,12 +36,7 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: --target x86_64-pc-windows-msvc
-          uploadWorkflowArtifacts: false
+        run: npm run build -- --target x86_64-pc-windows-msvc
 
       - name: Prepare Windows artifacts
         shell: pwsh
