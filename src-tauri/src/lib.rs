@@ -6,16 +6,18 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 
 struct DbState {
     conn: Mutex<Connection>,
+    db_path: PathBuf,
+    scan_running: Mutex<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ResourceVariant {
     id: i64,
@@ -35,26 +37,63 @@ struct ResourceVariant {
     season_number: Option<i64>,
     episode_number: Option<i64>,
     title_guess: String,
+    media_kind: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct LibraryGroup {
+struct MediaDirectory {
+    key: String,
+    path: String,
+    name: String,
+    parent_name: Option<String>,
+    file_count: usize,
+    total_size: i64,
+    files: Vec<ResourceVariant>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LibraryModule {
     key: String,
     title: String,
-    season_number: Option<i64>,
-    episode_number: Option<i64>,
-    variants: Vec<ResourceVariant>,
+    kind: String,
+    directory_count: usize,
+    file_count: usize,
+    total_size: i64,
+    directories: Vec<MediaDirectory>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LibraryData {
+    modules: Vec<LibraryModule>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ScanSummary {
     scanned_files: usize,
     imported_files: usize,
     skipped_files: usize,
+    skipped_short_files: usize,
+    recorded_directories: usize,
     ffprobe_missing: bool,
-    groups: Vec<LibraryGroup>,
+    library: LibraryData,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    phase: String,
+    discovered_files: usize,
+    processed_files: usize,
+    imported_files: usize,
+    skipped_files: usize,
+    skipped_short_files: usize,
+    total_files: Option<usize>,
+    current_path: Option<String>,
+    ffprobe_missing: bool,
 }
 
 #[derive(Debug, Default)]
@@ -99,6 +138,12 @@ struct AnalyzedFile {
     item_key: String,
 }
 
+#[derive(Debug)]
+enum AnalyzeSkip {
+    Other,
+    ShortVideo,
+}
+
 #[derive(Debug, Deserialize)]
 struct FfprobeOutput {
     streams: Option<Vec<FfprobeStream>>,
@@ -124,6 +169,8 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "m4v", "ts", "m2ts", "webm", "mpg", "mpeg", "mp3",
     "flac", "m4a", "aac", "ogg", "opus", "wav", "ape",
 ];
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape"];
+const MIN_VIDEO_SECONDS: f64 = 300.0;
 
 #[tauri::command]
 fn check_ffprobe() -> Result<String, String> {
@@ -135,24 +182,94 @@ fn check_ffprobe() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn scan_paths(paths: Vec<String>, db: State<'_, DbState>) -> Result<ScanSummary, String> {
+fn start_scan(paths: Vec<String>, app: AppHandle, db: State<'_, DbState>) -> Result<(), String> {
     if paths.is_empty() {
         return Err("至少需要选择一个目录".to_string());
     }
 
+    {
+        let mut running = db
+            .scan_running
+            .lock()
+            .map_err(|_| "扫描状态被占用，稍后再试".to_string())?;
+        if *running {
+            return Err("已有扫描任务正在运行".to_string());
+        }
+        *running = true;
+    }
+
+    let db_path = db.db_path.clone();
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_scan(paths, &db_path, Some(&app_handle));
+        match result {
+            Ok(summary) => {
+                let _ = app_handle.emit("scan-complete", summary);
+            }
+            Err(error) => {
+                let _ = app_handle.emit("scan-error", error);
+            }
+        }
+
+        {
+            let state = app_handle.state::<DbState>();
+            if let Ok(mut running) = state.scan_running.lock() {
+                *running = false;
+            };
+        }
+    });
+
+    Ok(())
+}
+
+fn run_scan(
+    paths: Vec<String>,
+    db_path: &Path,
+    app: Option<&AppHandle>,
+) -> Result<ScanSummary, String> {
     let ffprobe_missing = Command::new("ffprobe").arg("-version").output().is_err();
-    let mut scanned_files = 0;
+    let roots_for_cleanup = paths.clone();
+    let mut discovered_files = 0;
+    let mut processed_files = 0;
     let mut imported_files = 0;
     let mut skipped_files = 0;
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| "数据库连接被占用，稍后再试".to_string())?;
+    let mut skipped_short_files = 0;
+    let mut media_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut last_emit = Instant::now();
+
+    maybe_emit_scan_progress(
+        app,
+        "discovering",
+        discovered_files,
+        processed_files,
+        imported_files,
+        skipped_files,
+        skipped_short_files,
+        None,
+        None,
+        ffprobe_missing,
+        &mut last_emit,
+        true,
+    );
 
     for root in paths {
         let root_path = PathBuf::from(&root);
         if !root_path.exists() {
             skipped_files += 1;
+            maybe_emit_scan_progress(
+                app,
+                "discovering",
+                discovered_files,
+                processed_files,
+                imported_files,
+                skipped_files,
+                skipped_short_files,
+                None,
+                Some(root),
+                ffprobe_missing,
+                &mut last_emit,
+                true,
+            );
             continue;
         }
 
@@ -170,30 +287,148 @@ fn scan_paths(paths: Vec<String>, db: State<'_, DbState>) -> Result<ScanSummary,
                 continue;
             }
 
-            scanned_files += 1;
-            match analyze_file(path, &root_path, !ffprobe_missing) {
-                Ok(file) => {
-                    upsert_file(&conn, &file)?;
-                    imported_files += 1;
-                }
-                Err(_) => {
-                    skipped_files += 1;
-                }
-            }
+            discovered_files += 1;
+            media_files.push((path.to_path_buf(), root_path.clone()));
+            maybe_emit_scan_progress(
+                app,
+                "discovering",
+                discovered_files,
+                processed_files,
+                imported_files,
+                skipped_files,
+                skipped_short_files,
+                None,
+                Some(path.to_string_lossy().to_string()),
+                ffprobe_missing,
+                &mut last_emit,
+                false,
+            );
         }
     }
 
-    Ok(ScanSummary {
-        scanned_files,
+    let total_files = media_files.len();
+    let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+    init_schema(&conn).map_err(|error| error.to_string())?;
+    delete_roots(&conn, &roots_for_cleanup)?;
+    maybe_emit_scan_progress(
+        app,
+        "processing",
+        discovered_files,
+        processed_files,
         imported_files,
         skipped_files,
+        skipped_short_files,
+        Some(total_files),
+        None,
         ffprobe_missing,
-        groups: load_library(&conn)?,
+        &mut last_emit,
+        true,
+    );
+
+    for (path, root_path) in media_files {
+        processed_files += 1;
+        match analyze_file(&path, &root_path, !ffprobe_missing) {
+            Ok(file) => {
+                upsert_file(&conn, &file)?;
+                imported_files += 1;
+            }
+            Err(AnalyzeSkip::ShortVideo) => {
+                skipped_files += 1;
+                skipped_short_files += 1;
+            }
+            Err(AnalyzeSkip::Other) => {
+                skipped_files += 1;
+            }
+        }
+
+        maybe_emit_scan_progress(
+            app,
+            "processing",
+            discovered_files,
+            processed_files,
+            imported_files,
+            skipped_files,
+            skipped_short_files,
+            Some(total_files),
+            Some(path.to_string_lossy().to_string()),
+            ffprobe_missing,
+            &mut last_emit,
+            false,
+        );
+    }
+
+    maybe_emit_scan_progress(
+        app,
+        "processing",
+        discovered_files,
+        processed_files,
+        imported_files,
+        skipped_files,
+        skipped_short_files,
+        Some(total_files),
+        None,
+        ffprobe_missing,
+        &mut last_emit,
+        true,
+    );
+
+    let library = load_library(&conn)?;
+    let recorded_directories = library
+        .modules
+        .iter()
+        .map(|module| module.directory_count)
+        .sum();
+
+    Ok(ScanSummary {
+        scanned_files: processed_files,
+        imported_files,
+        skipped_files,
+        skipped_short_files,
+        recorded_directories,
+        ffprobe_missing,
+        library,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn maybe_emit_scan_progress(
+    app: Option<&AppHandle>,
+    phase: &str,
+    discovered_files: usize,
+    processed_files: usize,
+    imported_files: usize,
+    skipped_files: usize,
+    skipped_short_files: usize,
+    total_files: Option<usize>,
+    current_path: Option<String>,
+    ffprobe_missing: bool,
+    last_emit: &mut Instant,
+    force: bool,
+) {
+    if !force && last_emit.elapsed() < Duration::from_millis(250) {
+        return;
+    }
+
+    if let Some(app) = app {
+        let progress = ScanProgress {
+            phase: phase.to_string(),
+            discovered_files,
+            processed_files,
+            imported_files,
+            skipped_files,
+            skipped_short_files,
+            total_files,
+            current_path,
+            ffprobe_missing,
+        };
+        let _ = app.emit("scan-progress", progress);
+    }
+
+    *last_emit = Instant::now();
+}
+
 #[tauri::command]
-fn list_library(db: State<'_, DbState>) -> Result<Vec<LibraryGroup>, String> {
+fn list_library(db: State<'_, DbState>) -> Result<LibraryData, String> {
     let conn = db
         .conn
         .lock()
@@ -201,8 +436,12 @@ fn list_library(db: State<'_, DbState>) -> Result<Vec<LibraryGroup>, String> {
     load_library(&conn)
 }
 
-fn analyze_file(path: &Path, root_path: &Path, use_ffprobe: bool) -> Result<AnalyzedFile, String> {
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+fn analyze_file(
+    path: &Path,
+    root_path: &Path,
+    use_ffprobe: bool,
+) -> Result<AnalyzedFile, AnalyzeSkip> {
+    let metadata = fs::metadata(path).map_err(|_| AnalyzeSkip::Other)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -214,6 +453,11 @@ fn analyze_file(path: &Path, root_path: &Path, use_ffprobe: bool) -> Result<Anal
     } else {
         MediaProbe::default()
     };
+
+    if is_short_video(&probe) {
+        return Err(AnalyzeSkip::ShortVideo);
+    }
+
     let resolution = resolution_from_probe_or_name(probe.width, probe.height, &file_name);
     let path_string = path.to_string_lossy().to_string();
     let root_string = root_path.to_string_lossy().to_string();
@@ -243,6 +487,15 @@ fn analyze_file(path: &Path, root_path: &Path, use_ffprobe: bool) -> Result<Anal
         title_guess: parsed.title_guess,
         item_key: parsed.item_key,
     })
+}
+
+fn is_short_video(probe: &MediaProbe) -> bool {
+    let has_video = probe.video_codec.is_some() || probe.width.is_some() || probe.height.is_some();
+    has_video
+        && probe
+            .duration_seconds
+            .map(|duration| duration < MIN_VIDEO_SECONDS)
+            .unwrap_or(false)
 }
 
 fn probe_media(path: &Path) -> Result<MediaProbe, String> {
@@ -424,9 +677,9 @@ fn detect_source(value: &str) -> Option<String> {
 
 fn clean_title(value: &str) -> String {
     let tag_pattern = Regex::new(
-    r"(?i)\b(2160p|1080p|720p|480p|4k|8k|web[- ]?dl|webrip|bdrip|blu[- ]?ray|bdremux|remux|hdtv|x264|x265|h\.?264|h\.?265|hevc|av1|aac|flac|truehd|dts|10bit|8bit|hdr|dv)\b",
-  )
-  .expect("valid tag regex");
+        r"(?i)\b(2160p|1080p|720p|480p|4k|8k|web[- ]?dl|webrip|bdrip|blu[- ]?ray|bdremux|remux|hdtv|x264|x265|h\.?264|h\.?265|hevc|av1|aac|flac|truehd|dts|10bit|8bit|hdr|dv)\b",
+    )
+    .expect("valid tag regex");
     let bracket_pattern = Regex::new(r"[\[\(][^\]\)]*[\]\)]").expect("valid bracket regex");
     let separated = value.replace('.', " ").replace('_', " ");
     let no_tags = tag_pattern.replace_all(&separated, " ");
@@ -516,6 +769,22 @@ fn is_media_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_audio_file_name(file_name: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn media_kind_for_file(file: &ResourceVariant) -> String {
+    if file.video_codec.is_none() && file.width.is_none() && is_audio_file_name(&file.file_name) {
+        "music".to_string()
+    } else {
+        "video".to_string()
+    }
+}
+
 fn upsert_file(conn: &Connection, file: &AnalyzedFile) -> Result<(), String> {
     conn.execute(
         r#"
@@ -570,7 +839,18 @@ fn upsert_file(conn: &Connection, file: &AnalyzedFile) -> Result<(), String> {
     Ok(())
 }
 
-fn load_library(conn: &Connection) -> Result<Vec<LibraryGroup>, String> {
+fn delete_roots(conn: &Connection, roots: &[String]) -> Result<(), String> {
+    for root in roots {
+        conn.execute(
+            "DELETE FROM media_files WHERE root_path = ?1",
+            params![root],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn load_library(conn: &Connection) -> Result<LibraryData, String> {
     let mut stmt = conn
         .prepare(
             r#"
@@ -579,55 +859,197 @@ fn load_library(conn: &Connection) -> Result<Vec<LibraryGroup>, String> {
         video_codec, audio_codec, width, height, resolution, source, release_group,
         season_number, episode_number, title_guess, item_key
       FROM media_files
-      ORDER BY title_guess COLLATE NOCASE, season_number, episode_number, file_name COLLATE NOCASE
+      ORDER BY root_path COLLATE NOCASE, path COLLATE NOCASE
       "#,
         )
         .map_err(|error| error.to_string())?;
 
     let rows = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(17)?,
-                ResourceVariant {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    file_name: row.get(2)?,
-                    root_path: row.get(3)?,
-                    file_size: row.get(4)?,
-                    duration_seconds: row.get(5)?,
-                    container: row.get(6)?,
-                    video_codec: row.get(7)?,
-                    audio_codec: row.get(8)?,
-                    width: row.get(9)?,
-                    height: row.get(10)?,
-                    resolution: row.get(11)?,
-                    source: row.get(12)?,
-                    release_group: row.get(13)?,
-                    season_number: row.get(14)?,
-                    episode_number: row.get(15)?,
-                    title_guess: row.get(16)?,
-                },
-            ))
+            let mut file = ResourceVariant {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                file_name: row.get(2)?,
+                root_path: row.get(3)?,
+                file_size: row.get(4)?,
+                duration_seconds: row.get(5)?,
+                container: row.get(6)?,
+                video_codec: row.get(7)?,
+                audio_codec: row.get(8)?,
+                width: row.get(9)?,
+                height: row.get(10)?,
+                resolution: row.get(11)?,
+                source: row.get(12)?,
+                release_group: row.get(13)?,
+                season_number: row.get(14)?,
+                episode_number: row.get(15)?,
+                title_guess: row.get(16)?,
+                media_kind: String::new(),
+            };
+            file.media_kind = media_kind_for_file(&file);
+            Ok(file)
         })
         .map_err(|error| error.to_string())?;
 
-    let mut groups: Vec<LibraryGroup> = Vec::new();
+    let mut modules: Vec<LibraryModule> = Vec::new();
     for row in rows {
-        let (key, variant) = row.map_err(|error| error.to_string())?;
-        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
-            group.variants.push(variant);
-        } else {
-            groups.push(LibraryGroup {
-                key,
-                title: variant.title_guess.clone(),
-                season_number: variant.season_number,
-                episode_number: variant.episode_number,
-                variants: vec![variant],
+        let file = row.map_err(|error| error.to_string())?;
+        let dir_path = Path::new(&file.path)
+            .parent()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.root_path.clone());
+        let dir_name = Path::new(&dir_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("根目录")
+            .to_string();
+        let parent_name = Path::new(&dir_path)
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string());
+        let kind = file.media_kind.clone();
+        let module_title =
+            module_title_for_file(&file, &dir_path, &dir_name, parent_name.as_deref());
+        let module_key = format!("{}:{}", kind, normalize_key(&module_title));
+
+        let module_index = match modules.iter().position(|module| module.key == module_key) {
+            Some(index) => index,
+            None => {
+                modules.push(LibraryModule {
+                    key: module_key.clone(),
+                    title: module_title,
+                    kind: kind.clone(),
+                    directory_count: 0,
+                    file_count: 0,
+                    total_size: 0,
+                    directories: Vec::new(),
+                });
+                modules.len() - 1
+            }
+        };
+
+        let module = &mut modules[module_index];
+        module.file_count += 1;
+        module.total_size += file.file_size;
+
+        let directory_index = match module
+            .directories
+            .iter()
+            .position(|directory| directory.key == dir_path)
+        {
+            Some(index) => index,
+            None => {
+                module.directories.push(MediaDirectory {
+                    key: dir_path.clone(),
+                    path: dir_path.clone(),
+                    name: dir_name,
+                    parent_name,
+                    file_count: 0,
+                    total_size: 0,
+                    files: Vec::new(),
+                });
+                module.directory_count += 1;
+                module.directories.len() - 1
+            }
+        };
+
+        let directory = &mut module.directories[directory_index];
+        directory.file_count += 1;
+        directory.total_size += file.file_size;
+        directory.files.push(file);
+    }
+
+    for module in &mut modules {
+        module
+            .directories
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        for directory in &mut module.directories {
+            directory.files.sort_by(|a, b| {
+                let season_cmp = a.season_number.cmp(&b.season_number);
+                if season_cmp != std::cmp::Ordering::Equal {
+                    return season_cmp;
+                }
+                let episode_cmp = a.episode_number.cmp(&b.episode_number);
+                if episode_cmp != std::cmp::Ordering::Equal {
+                    return episode_cmp;
+                }
+                a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase())
             });
         }
     }
 
-    Ok(groups)
+    modules.sort_by(|a, b| {
+        let kind_cmp = a.kind.cmp(&b.kind);
+        if kind_cmp != std::cmp::Ordering::Equal {
+            return kind_cmp;
+        }
+        a.title.to_lowercase().cmp(&b.title.to_lowercase())
+    });
+
+    Ok(LibraryData { modules })
+}
+
+fn module_title_for_file(
+    file: &ResourceVariant,
+    dir_path: &str,
+    dir_name: &str,
+    parent_name: Option<&str>,
+) -> String {
+    if file.media_kind == "music" {
+        return music_artist_guess(&file.root_path, dir_path, dir_name, parent_name);
+    }
+
+    if is_generic_title(&file.title_guess) {
+        let dir_title = clean_title(dir_name);
+        if is_generic_title(&dir_title) {
+            parent_name.map(clean_title).unwrap_or(dir_title)
+        } else {
+            dir_title
+        }
+    } else {
+        file.title_guess.clone()
+    }
+}
+
+fn music_artist_guess(
+    root_path: &str,
+    dir_path: &str,
+    dir_name: &str,
+    parent_name: Option<&str>,
+) -> String {
+    let root = Path::new(root_path);
+    let dir = Path::new(dir_path);
+    if let Ok(relative) = dir.strip_prefix(root) {
+        let components = relative
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect::<Vec<_>>();
+        if let Some(first) = components.first() {
+            if !first.trim().is_empty() {
+                return clean_title(first);
+            }
+        }
+    }
+
+    parent_name
+        .map(clean_title)
+        .filter(|value| !is_generic_title(value))
+        .unwrap_or_else(|| clean_title(dir_name))
+}
+
+fn is_generic_title(value: &str) -> bool {
+    let normalized = value.trim().to_lowercase();
+    if normalized.is_empty() || normalized == "未命名资源" {
+        return true;
+    }
+
+    let compact = normalized.replace([' ', '.', '_', '-'], "");
+    compact.chars().all(|ch| ch.is_ascii_digit())
+        || matches!(
+            compact.as_str(),
+            "movie" | "sample" | "stream" | "bdmv" | "video" | "audio" | "extras" | "extra"
+        )
 }
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -659,6 +1081,7 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     CREATE INDEX IF NOT EXISTS idx_media_files_item_key ON media_files(item_key);
     CREATE INDEX IF NOT EXISTS idx_media_files_title ON media_files(title_guess);
+    CREATE INDEX IF NOT EXISTS idx_media_files_root ON media_files(root_path);
     "#,
     )
 }
@@ -667,10 +1090,12 @@ fn setup_database(app: &tauri::AppHandle) -> Result<DbState, Box<dyn std::error:
     let app_data_dir = app.path().app_data_dir()?;
     fs::create_dir_all(&app_data_dir)?;
     let db_path = app_data_dir.join("media_administrator.sqlite3");
-    let conn = Connection::open(db_path)?;
+    let conn = Connection::open(&db_path)?;
     init_schema(&conn)?;
     Ok(DbState {
         conn: Mutex::new(conn),
+        db_path,
+        scan_running: Mutex::new(false),
     })
 }
 
@@ -685,7 +1110,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             check_ffprobe,
-            scan_paths,
+            start_scan,
             list_library
         ])
         .run(tauri::generate_context!())

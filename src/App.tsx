@@ -1,7 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
-import type { LibraryGroup, ScanSummary } from "./types";
+import type { LibraryData, LibraryModule, MediaDirectory, ResourceVariant, ScanProgress, ScanSummary } from "./types";
+
+const EMPTY_LIBRARY: LibraryData = { modules: [] };
+
+type Theme = "light" | "dark";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "-";
@@ -25,31 +31,207 @@ function formatDuration(seconds: number | null): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function episodeLabel(group: LibraryGroup): string {
-  if (group.seasonNumber == null || group.episodeNumber == null) return "单项资源";
-  return `S${group.seasonNumber.toString().padStart(2, "0")}E${group.episodeNumber
-    .toString()
-    .padStart(2, "0")}`;
+function episodeLabel(file: ResourceVariant): string | null {
+  if (file.seasonNumber == null || file.episodeNumber == null) return null;
+  return `S${file.seasonNumber.toString().padStart(2, "0")}E${file.episodeNumber.toString().padStart(2, "0")}`;
+}
+
+function scanStatusText(progress: ScanProgress): string {
+  if (progress.phase === "discovering") {
+    return `正在统计目录媒体文件：已发现 ${progress.discoveredFiles} 个`;
+  }
+
+  const total = progress.totalFiles ?? progress.discoveredFiles;
+  return `后台分析媒体文件：${progress.processedFiles} / ${total}`;
+}
+
+function progressPercent(progress: ScanProgress | null): number | null {
+  if (!progress || progress.phase !== "processing" || !progress.totalFiles) return null;
+  return Math.min(100, Math.round((progress.processedFiles / progress.totalFiles) * 100));
+}
+
+function moduleMatches(module: LibraryModule, query: string): boolean {
+  const text = query.trim().toLowerCase();
+  if (!text) return true;
+  if (module.title.toLowerCase().includes(text)) return true;
+  return module.directories.some((directory) => {
+    if (directory.name.toLowerCase().includes(text) || directory.path.toLowerCase().includes(text)) return true;
+    return directory.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text));
+  });
+}
+
+function fileSpec(file: ResourceVariant): string {
+  const parts = [file.resolution, file.videoCodec, file.audioCodec].filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : file.container ?? "-";
+}
+
+function FileRows({ files }: { files: ResourceVariant[] }) {
+  return (
+    <div className="file-table-wrap">
+      <table className="file-table">
+        <thead>
+          <tr>
+            <th>文件</th>
+            <th>规格</th>
+            <th>大小</th>
+            <th>时长</th>
+            <th>路径</th>
+          </tr>
+        </thead>
+        <tbody>
+          {files.map((file) => (
+            <tr key={file.id}>
+              <td>
+                <div className="file-name">{file.fileName}</div>
+                <div className="muted">
+                  {[episodeLabel(file), file.releaseGroup, file.source].filter(Boolean).join(" / ") || file.titleGuess}
+                </div>
+              </td>
+              <td>{fileSpec(file)}</td>
+              <td>{formatBytes(file.fileSize)}</td>
+              <td>{formatDuration(file.durationSeconds)}</td>
+              <td>
+                <code title={file.path}>{file.path}</code>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function DirectoryBlock({ directory }: { directory: MediaDirectory }) {
+  return (
+    <details className="directory-block">
+      <summary>
+        <div className="directory-main">
+          <strong>{directory.name}</strong>
+          {directory.parentName ? <span>{directory.parentName}</span> : null}
+          <code title={directory.path}>{directory.path}</code>
+        </div>
+        <b>
+          {directory.fileCount} 个文件 · {formatBytes(directory.totalSize)}
+        </b>
+      </summary>
+      <FileRows files={directory.files} />
+    </details>
+  );
+}
+
+function ModuleList({ title, emptyText, modules }: { title: string; emptyText: string; modules: LibraryModule[] }) {
+  return (
+    <section className="library-section">
+      <header className="section-header">
+        <h3>{title}</h3>
+        <span>{modules.length} 个模块</span>
+      </header>
+
+      {modules.length === 0 ? <div className="empty">{emptyText}</div> : null}
+
+      <div className="module-list">
+        {modules.map((module) => (
+          <details className="module-block" key={module.key}>
+            <summary>
+              <div>
+                <strong>{module.title}</strong>
+                <span>{module.kind === "music" ? "音乐作者" : "影视模块"}</span>
+              </div>
+              <b>
+                {module.directoryCount} 个目录 · {module.fileCount} 个文件 · {formatBytes(module.totalSize)}
+              </b>
+            </summary>
+
+            <div className="directory-list">
+              {module.directories.map((directory) => (
+                <DirectoryBlock directory={directory} key={directory.key} />
+              ))}
+            </div>
+          </details>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 export default function App() {
   const [paths, setPaths] = useState<string[]>([]);
-  const [library, setLibrary] = useState<LibraryGroup[]>([]);
+  const [library, setLibrary] = useState<LibraryData>(EMPTY_LIBRARY);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("正在检查 ffprobe...");
   const [isScanning, setIsScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
+  const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
 
   async function refreshLibrary() {
-    const groups = await invoke<LibraryGroup[]>("list_library");
-    setLibrary(groups);
+    const data = await invoke<LibraryData>("list_library");
+    setLibrary(data);
   }
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   useEffect(() => {
     invoke<string>("check_ffprobe")
       .then((message) => setStatus(message))
       .catch((error) => setStatus(String(error)));
     refreshLibrary().catch((error) => setStatus(String(error)));
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenProgress: UnlistenFn | null = null;
+    let unlistenComplete: UnlistenFn | null = null;
+    let unlistenError: UnlistenFn | null = null;
+
+    listen<ScanProgress>("scan-progress", (event) => {
+      const progress = event.payload;
+      setIsScanning(true);
+      setScanProgress(progress);
+      setStatus(scanStatusText(progress));
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenProgress = unlisten;
+    });
+
+    listen<ScanSummary>("scan-complete", (event) => {
+      const summary = event.payload;
+      setLastScan(summary);
+      setLibrary(summary.library);
+      setIsScanning(false);
+      setScanProgress({
+        phase: "processing",
+        discoveredFiles: summary.scannedFiles,
+        processedFiles: summary.scannedFiles,
+        importedFiles: summary.importedFiles,
+        skippedFiles: summary.skippedFiles,
+        skippedShortFiles: summary.skippedShortFiles,
+        totalFiles: summary.scannedFiles,
+        currentPath: null,
+        ffprobeMissing: summary.ffprobeMissing,
+      });
+      setStatus(summary.ffprobeMissing ? "扫描完成，但没有找到 ffprobe，短视频过滤可能不完整" : "扫描完成");
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenComplete = unlisten;
+    });
+
+    listen<string>("scan-error", (event) => {
+      setIsScanning(false);
+      setStatus(String(event.payload));
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenError = unlisten;
+    });
+
+    return () => {
+      disposed = true;
+      unlistenProgress?.();
+      unlistenComplete?.();
+      unlistenError?.();
+    };
   }, []);
 
   async function chooseDirectories() {
@@ -67,36 +249,38 @@ export default function App() {
   async function scan() {
     if (paths.length === 0) return;
     setIsScanning(true);
-    setStatus("正在扫描目录...");
+    setScanProgress({
+      phase: "discovering",
+      discoveredFiles: 0,
+      processedFiles: 0,
+      importedFiles: 0,
+      skippedFiles: 0,
+      skippedShortFiles: 0,
+      totalFiles: null,
+      currentPath: null,
+      ffprobeMissing: false,
+    });
+    setStatus("后台扫描已启动...");
     try {
-      const summary = await invoke<ScanSummary>("scan_paths", { paths });
-      setLastScan(summary);
-      setLibrary(summary.groups);
-      setStatus(summary.ffprobeMissing ? "扫描完成，但没有找到 ffprobe" : "扫描完成");
+      await invoke<void>("start_scan", { paths });
     } catch (error) {
       setStatus(String(error));
-    } finally {
       setIsScanning(false);
     }
   }
 
-  const filteredLibrary = useMemo(() => {
-    const text = query.trim().toLowerCase();
-    if (!text) return library;
-    return library.filter((group) => {
-      if (group.title.toLowerCase().includes(text)) return true;
-      return group.variants.some((variant) => variant.path.toLowerCase().includes(text));
-    });
-  }, [library, query]);
+  const filteredModules = useMemo(() => library.modules.filter((module) => moduleMatches(module, query)), [library, query]);
+  const musicModules = useMemo(() => filteredModules.filter((module) => module.kind === "music"), [filteredModules]);
+  const videoModules = useMemo(() => filteredModules.filter((module) => module.kind === "video"), [filteredModules]);
 
   const totals = useMemo(() => {
-    const variants = library.reduce((sum, group) => sum + group.variants.length, 0);
-    const bytes = library.reduce(
-      (sum, group) => sum + group.variants.reduce((inner, variant) => inner + variant.fileSize, 0),
-      0,
-    );
-    return { variants, bytes };
+    const directories = library.modules.reduce((sum, module) => sum + module.directoryCount, 0);
+    const files = library.modules.reduce((sum, module) => sum + module.fileCount, 0);
+    const bytes = library.modules.reduce((sum, module) => sum + module.totalSize, 0);
+    return { modules: library.modules.length, directories, files, bytes };
   }, [library]);
+
+  const percent = progressPercent(scanProgress);
 
   return (
     <main className="app-shell">
@@ -104,12 +288,15 @@ export default function App() {
         <div className="brand">
           <div>
             <h1>Media Administrator</h1>
-            <p>本地媒体资源索引</p>
+            <p>目录级媒体资源索引</p>
           </div>
+          <button type="button" className="theme-toggle" onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
+            {theme === "dark" ? "浅色" : "暗黑"}
+          </button>
         </div>
 
         <section className="panel">
-          <div className="panel-title">目录</div>
+          <div className="panel-title">扫描目录</div>
           <div className="path-list">
             {paths.length === 0 ? <span className="muted">未选择目录</span> : null}
             {paths.map((path) => (
@@ -130,12 +317,16 @@ export default function App() {
 
         <section className="stats">
           <div>
-            <span>{library.length}</span>
-            <small>条目</small>
+            <span>{totals.modules}</span>
+            <small>模块</small>
           </div>
           <div>
-            <span>{totals.variants}</span>
-            <small>资源</small>
+            <span>{totals.directories}</span>
+            <small>目录</small>
+          </div>
+          <div>
+            <span>{totals.files}</span>
+            <small>文件</small>
           </div>
           <div>
             <span>{formatBytes(totals.bytes)}</span>
@@ -146,9 +337,23 @@ export default function App() {
         <section className="panel">
           <div className="panel-title">状态</div>
           <p className="status">{status}</p>
+          {scanProgress ? (
+            <div className="progress-block">
+              <div className="progress-bar" data-indeterminate={percent == null && isScanning ? "true" : "false"}>
+                <div className="progress-fill" style={{ width: `${percent ?? 42}%` }} />
+              </div>
+              <div className="progress-meta">
+                <span>发现 {scanProgress.discoveredFiles}</span>
+                <span>已处理 {scanProgress.processedFiles}</span>
+                <span>已入库 {scanProgress.importedFiles}</span>
+                <span>短视频过滤 {scanProgress.skippedShortFiles}</span>
+              </div>
+              {scanProgress.currentPath ? <code className="current-path">{scanProgress.currentPath}</code> : null}
+            </div>
+          ) : null}
           {lastScan ? (
             <p className="muted">
-              最近扫描：{lastScan.importedFiles} 个媒体文件，跳过 {lastScan.skippedFiles} 个文件
+              最近扫描：入库 {lastScan.importedFiles} 个媒体文件，记录 {lastScan.recordedDirectories} 个目录，短视频过滤 {lastScan.skippedShortFiles} 个
             </p>
           ) : null}
         </section>
@@ -158,69 +363,18 @@ export default function App() {
         <header className="toolbar">
           <div>
             <h2>媒体库</h2>
-            <p>每个资源路径都会保留在对应条目下。</p>
+            <p>按作者、影视系列和电影模块归类；展开模块查看包含它的所有目录。</p>
           </div>
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索标题或路径"
-            aria-label="搜索标题或路径"
+            placeholder="搜索模块、目录或文件路径"
+            aria-label="搜索模块、目录或文件路径"
           />
         </header>
 
-        <div className="library-list">
-          {filteredLibrary.length === 0 ? (
-            <div className="empty">暂无资源。选择目录后开始扫描。</div>
-          ) : null}
-
-          {filteredLibrary.map((group) => (
-            <details className="media-group" key={group.key}>
-              <summary>
-                <div>
-                  <strong>{group.title}</strong>
-                  <span>{episodeLabel(group)}</span>
-                </div>
-                <b>{group.variants.length} 个资源</b>
-              </summary>
-
-              <div className="variant-table-wrap">
-                <table className="variant-table">
-                  <thead>
-                    <tr>
-                      <th>版本</th>
-                      <th>规格</th>
-                      <th>大小</th>
-                      <th>时长</th>
-                      <th>路径</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {group.variants.map((variant) => (
-                      <tr key={variant.id}>
-                        <td>
-                          <div className="variant-name">{variant.releaseGroup ?? "未知发布组"}</div>
-                          <div className="muted">{variant.source ?? "未知来源"}</div>
-                        </td>
-                        <td>
-                          <div>
-                            {[variant.resolution, variant.videoCodec, variant.audioCodec].filter(Boolean).join(" / ") ||
-                              "-"}
-                          </div>
-                          <div className="muted">{variant.container ?? "-"}</div>
-                        </td>
-                        <td>{formatBytes(variant.fileSize)}</td>
-                        <td>{formatDuration(variant.durationSeconds)}</td>
-                        <td>
-                          <code title={variant.path}>{variant.path}</code>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </details>
-          ))}
-        </div>
+        <ModuleList title="音乐作者" emptyText="暂无音乐作者。" modules={musicModules} />
+        <ModuleList title="影视 / 番剧 / 电影" emptyText="暂无影视模块。" modules={videoModules} />
       </section>
     </main>
   );

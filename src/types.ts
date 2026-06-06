@@ -16,20 +16,51 @@ export type ResourceVariant = {
   seasonNumber: number | null;
   episodeNumber: number | null;
   titleGuess: string;
+  mediaKind: "music" | "video";
 };
 
-export type LibraryGroup = {
+export type MediaDirectory = {
+  key: string;
+  path: string;
+  name: string;
+  parentName: string | null;
+  fileCount: number;
+  totalSize: number;
+  files: ResourceVariant[];
+};
+
+export type LibraryModule = {
   key: string;
   title: string;
-  seasonNumber: number | null;
-  episodeNumber: number | null;
-  variants: ResourceVariant[];
+  kind: "music" | "video";
+  directoryCount: number;
+  fileCount: number;
+  totalSize: number;
+  directories: MediaDirectory[];
+};
+
+export type LibraryData = {
+  modules: LibraryModule[];
 };
 
 export type ScanSummary = {
   scannedFiles: number;
   importedFiles: number;
   skippedFiles: number;
+  skippedShortFiles: number;
+  recordedDirectories: number;
   ffprobeMissing: boolean;
-  groups: LibraryGroup[];
+  library: LibraryData;
+};
+
+export type ScanProgress = {
+  phase: "discovering" | "processing";
+  discoveredFiles: number;
+  processedFiles: number;
+  importedFiles: number;
+  skippedFiles: number;
+  skippedShortFiles: number;
+  totalFiles: number | null;
+  currentPath: string | null;
+  ffprobeMissing: boolean;
 };
