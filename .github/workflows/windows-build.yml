@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-windows:
-    name: Build Windows Installer
+    name: Build Windows Packages
     runs-on: windows-latest
     permissions:
       contents: read
@@ -33,7 +33,7 @@ jobs:
           workspaces: "./src-tauri -> target"
 
       - name: Install frontend dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v1
@@ -41,5 +41,32 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: --target x86_64-pc-windows-msvc
-          uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: windows-[arch]-[bundle]
+          uploadWorkflowArtifacts: false
+
+      - name: Prepare Windows artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $portableDir = "artifacts/Media-Administrator-$version-windows-x64-portable"
+          $installerDir = "artifacts/windows-x64-installer"
+          New-Item -ItemType Directory -Force -Path $portableDir, $installerDir | Out-Null
+
+          Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/media-administrator.exe" "$portableDir/Media Administrator.exe"
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "artifacts/Media-Administrator-$version-windows-x64-portable.zip" -Force
+
+          Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe" $installerDir
+
+      - name: Upload Windows portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Media-Administrator-windows-x64-portable
+          path: artifacts/*portable.zip
+          if-no-files-found: error
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Media-Administrator-windows-x64-installer
+          path: artifacts/windows-x64-installer/*.exe
+          if-no-files-found: error
