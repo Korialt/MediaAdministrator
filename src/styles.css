@@ -285,6 +285,41 @@ button.primary {
   color: var(--muted);
 }
 
+
+.entry-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 16px;
+}
+
+.entry-card {
+  display: grid;
+  gap: 10px;
+  min-height: 180px;
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 22px;
+  text-align: left;
+}
+
+.entry-card span {
+  color: var(--heading-muted);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.entry-card strong {
+  color: var(--accent);
+  font-size: 48px;
+  line-height: 1;
+}
+
+.entry-card small {
+  color: var(--muted);
+  font-size: 14px;
+}
+
 .library-section {
   display: grid;
   gap: 12px;
@@ -464,6 +499,10 @@ code {
   .section-header {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .entry-panel {
+    grid-template-columns: 1fr;
   }
 
   .toolbar input {

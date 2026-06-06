@@ -94,6 +94,8 @@ struct MediaProbe {
     audio_codec: Option<String>,
     width: Option<i64>,
     height: Option<i64>,
+    has_video: bool,
+    has_audio: bool,
 }
 
 #[derive(Debug)]
@@ -159,7 +161,6 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "m4v", "ts", "m2ts", "webm", "mpg", "mpeg", "mp3",
     "flac", "m4a", "aac", "ogg", "opus", "wav", "ape",
 ];
-const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape"];
 const MIN_VIDEO_SECONDS: f64 = 300.0;
 
 #[tauri::command]
@@ -435,10 +436,14 @@ fn analyze_file(
         .to_string();
     let parsed = parse_name(&file_name);
     let probe = if use_ffprobe {
-        probe_media(path).unwrap_or_default()
+        probe_media(path).map_err(|_| AnalyzeSkip::Other)?
     } else {
-        MediaProbe::default()
+        return Err(AnalyzeSkip::Other);
     };
+
+    if !probe.has_video && !probe.has_audio {
+        return Err(AnalyzeSkip::Other);
+    }
 
     if is_short_video(&probe) {
         return Err(AnalyzeSkip::ShortVideo);
@@ -476,8 +481,7 @@ fn analyze_file(
 }
 
 fn is_short_video(probe: &MediaProbe) -> bool {
-    let has_video = probe.video_codec.is_some() || probe.width.is_some() || probe.height.is_some();
-    has_video
+    probe.has_video
         && probe
             .duration_seconds
             .map(|duration| duration < MIN_VIDEO_SECONDS)
@@ -514,17 +518,29 @@ fn probe_media(path: &Path) -> Result<MediaProbe, String> {
     if let Some(streams) = parsed.streams {
         for stream in streams {
             match stream.codec_type.as_deref() {
-                Some("video") if probe.video_codec.is_none() => {
-                    probe.video_codec = stream.codec_name.map(normalize_video_codec);
-                    probe.width = stream.width;
-                    probe.height = stream.height;
-                    if probe.duration_seconds.is_none() {
-                        probe.duration_seconds =
-                            stream.duration.and_then(|value| value.parse::<f64>().ok());
+                Some("video") => {
+                    probe.has_video = true;
+                    if probe.video_codec.is_none() {
+                        probe.video_codec = stream
+                            .codec_name
+                            .map(normalize_video_codec)
+                            .or_else(|| Some("Unknown Video".to_string()));
+                        probe.width = stream.width;
+                        probe.height = stream.height;
+                        if probe.duration_seconds.is_none() {
+                            probe.duration_seconds =
+                                stream.duration.and_then(|value| value.parse::<f64>().ok());
+                        }
                     }
                 }
-                Some("audio") if probe.audio_codec.is_none() => {
-                    probe.audio_codec = stream.codec_name.map(normalize_audio_codec);
+                Some("audio") => {
+                    probe.has_audio = true;
+                    if probe.audio_codec.is_none() {
+                        probe.audio_codec = stream
+                            .codec_name
+                            .map(normalize_audio_codec)
+                            .or_else(|| Some("Unknown Audio".to_string()));
+                    }
                 }
                 _ => {}
             }
@@ -755,19 +771,13 @@ fn is_media_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_audio_file_name(file_name: &str) -> bool {
-    Path::new(file_name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-fn media_kind_for_file(file: &ResourceVariant) -> String {
-    if file.video_codec.is_none() && file.width.is_none() && is_audio_file_name(&file.file_name) {
-        "music".to_string()
+fn media_kind_for_file(file: &ResourceVariant) -> Option<String> {
+    if file.video_codec.is_some() || file.width.is_some() || file.height.is_some() {
+        Some("video".to_string())
+    } else if file.audio_codec.is_some() {
+        Some("music".to_string())
     } else {
-        "video".to_string()
+        None
     }
 }
 
@@ -872,7 +882,7 @@ fn load_library(conn: &Connection) -> Result<LibraryData, String> {
                 title_guess: row.get(16)?,
                 media_kind: String::new(),
             };
-            file.media_kind = media_kind_for_file(&file);
+            file.media_kind = media_kind_for_file(&file).unwrap_or_else(|| "ignored".to_string());
             Ok(file)
         })
         .map_err(|error| error.to_string())?;
@@ -882,10 +892,10 @@ fn load_library(conn: &Connection) -> Result<LibraryData, String> {
 
     for row in rows {
         let file = row.map_err(|error| error.to_string())?;
-        let directory = if file.media_kind == "music" {
-            &mut music_directories
-        } else {
-            &mut video_directories
+        let directory = match file.media_kind.as_str() {
+            "music" => &mut music_directories,
+            "video" => &mut video_directories,
+            _ => continue,
         };
         push_file_into_directory(directory, file);
     }

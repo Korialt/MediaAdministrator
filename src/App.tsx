@@ -9,6 +9,7 @@ const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [] 
 
 type Theme = "light" | "dark";
 type ViewMode = "list" | "grid";
+type ActiveEntry = "home" | "music" | "video";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "-";
@@ -152,6 +153,35 @@ function DirectorySection({
   );
 }
 
+function EntryPanel({
+  musicCount,
+  videoCount,
+  musicFiles,
+  videoFiles,
+  onSelect,
+}: {
+  musicCount: number;
+  videoCount: number;
+  musicFiles: number;
+  videoFiles: number;
+  onSelect: (entry: ActiveEntry) => void;
+}) {
+  return (
+    <section className="entry-panel">
+      <button type="button" className="entry-card" onClick={() => onSelect("music")}>
+        <span>音乐</span>
+        <strong>{musicCount}</strong>
+        <small>{musicFiles} 个音频文件</small>
+      </button>
+      <button type="button" className="entry-card" onClick={() => onSelect("video")}>
+        <span>影视</span>
+        <strong>{videoCount}</strong>
+        <small>{videoFiles} 个视频文件</small>
+      </button>
+    </section>
+  );
+}
+
 export default function App() {
   const [paths, setPaths] = useState<string[]>([]);
   const [library, setLibrary] = useState<LibraryData>(EMPTY_LIBRARY);
@@ -162,6 +192,7 @@ export default function App() {
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [activeEntry, setActiveEntry] = useState<ActiveEntry>("home");
 
   async function refreshLibrary() {
     const data = await invoke<LibraryData>("list_library");
@@ -290,6 +321,9 @@ export default function App() {
   }, [library]);
 
   const percent = progressPercent(scanProgress);
+  const activeDirectories = activeEntry === "music" ? musicDirectories : videoDirectories;
+  const activeTitle = activeEntry === "music" ? "音乐目录" : "影视目录";
+  const activeEmptyText = activeEntry === "music" ? "暂无音乐目录。" : "暂无影视目录。";
 
   return (
     <main className="app-shell">
@@ -371,29 +405,43 @@ export default function App() {
       <section className="content">
         <header className="toolbar">
           <div>
-            <h2>媒体库</h2>
-            <p>音乐和影视独立显示，主条目就是所在目录，例如 OST/author1/title2。</p>
+            <h2>{activeEntry === "home" ? "媒体库" : activeTitle}</h2>
+            <p>{activeEntry === "home" ? "音乐和影视是两个独立入口，进入后只显示对应目录。" : "主条目就是所在目录，例如 OST/author1/title2。"}</p>
           </div>
-          <div className="toolbar-actions">
-            <div className="view-switch" aria-label="显示格式">
-              <button type="button" className={viewMode === "list" ? "active" : ""} onClick={() => setViewMode("list")}>
-                列表
+          {activeEntry !== "home" ? (
+            <div className="toolbar-actions">
+              <button type="button" onClick={() => setActiveEntry("home")}>
+                返回入口
               </button>
-              <button type="button" className={viewMode === "grid" ? "active" : ""} onClick={() => setViewMode("grid")}>
-                图表
-              </button>
+              <div className="view-switch" aria-label="显示格式">
+                <button type="button" className={viewMode === "list" ? "active" : ""} onClick={() => setViewMode("list")}>
+                  列表
+                </button>
+                <button type="button" className={viewMode === "grid" ? "active" : ""} onClick={() => setViewMode("grid")}>
+                  图表
+                </button>
+              </div>
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索目录或文件路径"
+                aria-label="搜索目录或文件路径"
+              />
             </div>
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索目录或文件路径"
-              aria-label="搜索目录或文件路径"
-            />
-          </div>
+          ) : null}
         </header>
 
-        <DirectorySection title="音乐目录" emptyText="暂无音乐目录。" directories={musicDirectories} mode={viewMode} />
-        <DirectorySection title="影视目录" emptyText="暂无影视目录。" directories={videoDirectories} mode={viewMode} />
+        {activeEntry === "home" ? (
+          <EntryPanel
+            musicCount={totals.musicDirectories}
+            videoCount={totals.videoDirectories}
+            musicFiles={library.musicDirectories.reduce((sum, directory) => sum + directory.fileCount, 0)}
+            videoFiles={library.videoDirectories.reduce((sum, directory) => sum + directory.fileCount, 0)}
+            onSelect={setActiveEntry}
+          />
+        ) : (
+          <DirectorySection title={activeTitle} emptyText={activeEmptyText} directories={activeDirectories} mode={viewMode} />
+        )}
       </section>
     </main>
   );
