@@ -3,15 +3,26 @@ name: Windows Build
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publishRelease:
+        description: "Create or update a GitHub Release from this run"
+        required: false
+        type: boolean
+        default: false
+      releaseTag:
+        description: "Release tag name, defaults to v<package.json version>"
+        required: false
+        type: string
 
 jobs:
   build-windows:
     name: Build Windows Packages
     runs-on: windows-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
@@ -65,3 +76,53 @@ jobs:
           name: Media-Administrator-windows-x64-installer
           path: artifacts/windows-x64-installer/*.exe
           if-no-files-found: error
+
+      - name: Resolve release metadata
+        id: release
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publishRelease) }}
+        shell: pwsh
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.releaseTag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $tag = "${{ github.ref_name }}"
+
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            if ([string]::IsNullOrWhiteSpace($env:RELEASE_TAG_INPUT)) {
+              $tag = "v$version"
+            } else {
+              $tag = $env:RELEASE_TAG_INPUT.Trim()
+            }
+          }
+
+          if (-not $tag.StartsWith("v")) {
+            $tag = "v$tag"
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "title=Media Administrator $tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish GitHub Release
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publishRelease) }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "${{ steps.release.outputs.tag }}"
+          $title = "${{ steps.release.outputs.title }}"
+          $assets = @(
+            Get-ChildItem -Path "artifacts/*portable.zip" -File | Select-Object -ExpandProperty FullName
+            Get-ChildItem -Path "artifacts/windows-x64-installer/*.exe" -File | Select-Object -ExpandProperty FullName
+          )
+
+          if ($assets.Count -eq 0) {
+            throw "No release assets found."
+          }
+
+          if (gh release view $tag *> $null) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title $title --notes "Windows x64 build for $tag." --target $env:GITHUB_SHA
+          }
