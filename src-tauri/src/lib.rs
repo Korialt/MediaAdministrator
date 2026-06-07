@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -226,6 +226,7 @@ const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", 
 const MIN_VIDEO_SECONDS: f64 = 300.0;
 const SCAN_STOPPED_MESSAGE: &str = "扫描已停止";
 const SKIP_FILE_MESSAGE: &str = "已跳过当前文件";
+static COMMAND_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -264,14 +265,34 @@ fn command_output(
         return command.output().map_err(|error| error.to_string());
     }
 
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let output_id = COMMAND_OUTPUT_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let output_base = format!(
+        "media_administrator_command_{}_{}_{}",
+        std::process::id(),
+        current_time_millis(),
+        output_id
+    );
+    let stdout_path = std::env::temp_dir().join(format!("{output_base}.stdout"));
+    let stderr_path = std::env::temp_dir().join(format!("{output_base}.stderr"));
+    let stdout_file = fs::File::create(&stdout_path).map_err(|error| error.to_string())?;
+    let stderr_file = fs::File::create(&stderr_path).map_err(|error| error.to_string())?;
+
+    command
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    let mut child = command.spawn().map_err(|error| {
+        let _ = fs::remove_file(&stdout_path);
+        let _ = fs::remove_file(&stderr_path);
+        error.to_string()
+    })?;
 
     loop {
         if let Some(stop_requested) = stop_requested {
             if stop_requested.load(Ordering::SeqCst) {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
                 return Err(SCAN_STOPPED_MESSAGE.to_string());
             }
         }
@@ -280,15 +301,32 @@ fn command_output(
             if skip_requested.load(Ordering::SeqCst) {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
                 return Err(SKIP_FILE_MESSAGE.to_string());
             }
         }
 
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
+            Ok(Some(status)) => {
+                let stdout_result = fs::read(&stdout_path);
+                let stderr_result = fs::read(&stderr_path);
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                let stdout = stdout_result.map_err(|error| error.to_string())?;
+                let stderr = stderr_result.map_err(|error| error.to_string())?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
                 let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
                 return Err(error.to_string());
             }
         }
