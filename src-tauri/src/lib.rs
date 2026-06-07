@@ -1476,12 +1476,19 @@ fn parse_name(file_name: &str) -> ParsedName {
     } else {
         None
     };
+    let leading_episode = if season_episode.is_none() && anime_episode.is_none() {
+        detect_leading_episode(&without_group)
+    } else {
+        None
+    };
 
     let (title_source, season_number, episode_number) =
         if let Some((start, season, episode)) = season_episode {
             (&without_group[..start], Some(season), Some(episode))
         } else if let Some((start, episode)) = anime_episode {
             (&without_group[..start], Some(1), Some(episode))
+        } else if let Some(episode) = leading_episode {
+            ("", Some(1), Some(episode))
         } else {
             (without_group.as_str(), None, None)
         };
@@ -1533,6 +1540,22 @@ fn detect_anime_episode(value: &str) -> Option<(usize, i64)> {
     }
 
     None
+}
+
+fn detect_leading_episode(value: &str) -> Option<i64> {
+    let pattern = Regex::new(r"(?i)^\s*(\d{1,3})(?:v\d+)?(?:$|([\s._\-\[\(].*)$)").ok()?;
+    let caps = pattern.captures(value)?;
+    let episode_text = caps.get(1)?.as_str();
+    let episode = episode_text.parse::<i64>().ok()?;
+    if !(1..=999).contains(&episode) {
+        return None;
+    }
+
+    let rest = caps.get(2).map(|value| value.as_str()).unwrap_or_default();
+    let has_leading_zero = episode_text.len() > 1 && episode_text.starts_with('0');
+    let rest_is_only_technical = clean_title(rest) == "未命名资源";
+
+    (has_leading_zero || rest_is_only_technical).then_some(episode)
 }
 
 fn detect_release_group(stem: &str) -> Option<String> {
@@ -2761,6 +2784,44 @@ mod tests {
             infer_series_family_title(&parsed.title_guess).as_deref(),
             Some("Monogatari")
         );
+    }
+
+    #[test]
+    fn leading_number_episode_uses_directory_series() {
+        let parsed = parse_name("01 - Awakening [BDRip 1080p].mkv");
+
+        assert_eq!(parsed.title_guess, "未命名资源");
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(
+            infer_video_series(
+                Path::new("/library/Some Anime/01 - Awakening [BDRip 1080p].mkv"),
+                Path::new("/library"),
+                &parsed
+            ),
+            (
+                Some("Some Anime".to_string()),
+                Some("directory".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn technical_only_number_episode_uses_directory_series() {
+        let parsed = parse_name("10 [1080p][BDRip].mkv");
+
+        assert_eq!(parsed.title_guess, "未命名资源");
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(10));
+    }
+
+    #[test]
+    fn numeric_movie_title_stays_filename_series() {
+        let parsed = parse_name("12 Angry Men.mkv");
+
+        assert_eq!(parsed.title_guess, "12 Angry Men");
+        assert_eq!(parsed.season_number, None);
+        assert_eq!(parsed.episode_number, None);
     }
 
     #[test]
