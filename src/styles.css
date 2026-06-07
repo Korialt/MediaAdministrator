@@ -297,10 +297,70 @@ button.danger {
   white-space: normal;
 }
 
-.skip-current {
+.last-scan-block {
+  display: grid;
+  gap: 8px;
+}
+
+.last-scan-block p {
+  margin: 0;
+}
+
+.skip-list-toggle {
   width: 100%;
   border-color: var(--accent);
   color: var(--accent-text);
+}
+
+.skip-list {
+  display: grid;
+  gap: 8px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface-alt);
+  padding: 9px;
+}
+
+.skip-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--heading-muted);
+  font-size: 12px;
+}
+
+.skip-list-header span {
+  color: var(--muted);
+}
+
+.skip-item {
+  display: grid;
+  gap: 5px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 8px;
+}
+
+.skip-item div {
+  display: grid;
+  gap: 3px;
+}
+
+.skip-item strong {
+  overflow-wrap: anywhere;
+}
+
+.skip-item span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.skip-item code {
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .current-path {

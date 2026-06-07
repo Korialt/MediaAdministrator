@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { LibraryData, MediaDirectory, MediaGroup, ResourceVariant, ScanProgress, ScanSummary } from "./types";
+import type { LibraryData, MediaDirectory, MediaGroup, ResourceVariant, ScanProgress, ScanSkip, ScanSummary } from "./types";
 
 const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [], musicArtists: [], videoSeries: [] };
 
@@ -79,6 +79,13 @@ function processingSpeed(progress: ScanProgress | null, nowMs: number): string {
   if (!progress || progress.processedFiles === 0) return "-";
   const elapsedSeconds = Math.max(1, (nowMs - progress.scanStartedAtMs) / 1000);
   return `${(progress.processedFiles / elapsedSeconds).toFixed(2)} 个/秒`;
+}
+
+function skipReasonLabel(reason: string): string {
+  if (reason === "analysis_failed") return "分析失败";
+  if (reason === "manual_skip") return "手动跳过";
+  if (reason === "short_video") return "短视频";
+  return reason || "未知原因";
 }
 
 function directoryMatches(directory: MediaDirectory, query: string): boolean {
@@ -341,7 +348,9 @@ export default function App() {
   const [status, setStatus] = useState("正在检查 ffprobe...");
   const [isScanning, setIsScanning] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
-  const [isSkippingCurrent, setIsSkippingCurrent] = useState(false);
+  const [isLoadingSkips, setIsLoadingSkips] = useState(false);
+  const [skipListVisible, setSkipListVisible] = useState(false);
+  const [scanSkips, setScanSkips] = useState<ScanSkip[]>([]);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
@@ -386,7 +395,6 @@ export default function App() {
       setNowMs(Date.now());
       scanStartedAtRef.current = progress.scanStartedAtMs;
       setScanProgress(progress);
-      setIsSkippingCurrent(false);
       setStatus(scanStatusText(progress));
     }).then((unlisten) => {
       if (disposed) unlisten();
@@ -399,7 +407,8 @@ export default function App() {
       setLibrary(summary.library);
       setIsScanning(false);
       setIsStopping(false);
-      setIsSkippingCurrent(false);
+      setSkipListVisible(false);
+      setScanSkips([]);
       const completedAtMs = Date.now();
       const scanStartedAtMs = scanStartedAtRef.current ?? completedAtMs;
       setNowMs(completedAtMs);
@@ -428,7 +437,6 @@ export default function App() {
     listen<string>("scan-error", (event) => {
       setIsScanning(false);
       setIsStopping(false);
-      setIsSkippingCurrent(false);
       scanStartedAtRef.current = null;
       setStatus(String(event.payload));
       refreshLibrary().catch((error) => setStatus(String(error)));
@@ -478,7 +486,9 @@ export default function App() {
     const startedAtMs = Date.now();
     setIsScanning(true);
     setIsStopping(false);
-    setIsSkippingCurrent(false);
+    setLastScan(null);
+    setSkipListVisible(false);
+    setScanSkips([]);
     setNowMs(startedAtMs);
     scanStartedAtRef.current = startedAtMs;
     setScanProgress({
@@ -508,7 +518,6 @@ export default function App() {
 
   async function stopScan() {
     setIsStopping(true);
-    setIsSkippingCurrent(false);
     setStatus("正在停止扫描...");
     try {
       await invoke<void>("stop_scan");
@@ -518,14 +527,18 @@ export default function App() {
     }
   }
 
-  async function skipCurrentFile() {
-    setIsSkippingCurrent(true);
-    setStatus("正在跳过当前文件...");
+  async function showScanSkips() {
+    setIsLoadingSkips(true);
+    setStatus("正在读取跳过清单...");
     try {
-      await invoke<void>("skip_current_file");
+      const skips = await invoke<ScanSkip[]>("list_scan_skips");
+      setScanSkips(skips);
+      setSkipListVisible(true);
+      setStatus(skips.length > 0 ? `已加载 ${skips.length} 个跳过项` : "没有非短视频跳过项");
     } catch (error) {
-      setIsSkippingCurrent(false);
       setStatus(String(error));
+    } finally {
+      setIsLoadingSkips(false);
     }
   }
 
@@ -723,17 +736,35 @@ export default function App() {
                   <code title={scanProgress.currentPath}>{scanProgress.currentPath}</code>
                 </div>
               ) : null}
-              {scanProgress.canSkipCurrentFile ? (
-                <button type="button" className="skip-current" disabled={isSkippingCurrent || isStopping} onClick={skipCurrentFile}>
-                  {isSkippingCurrent ? "跳过中" : "跳过当前文件"}
-                </button>
-              ) : null}
             </div>
           ) : null}
           {lastScan ? (
-            <p className="muted">
-              最近扫描：入库 {lastScan.importedFiles} 个媒体文件，记录 {lastScan.recordedDirectories} 个目录，短视频过滤 {lastScan.skippedShortFiles} 个
-            </p>
+            <div className="last-scan-block">
+              <p className="muted">
+                最近扫描：入库 {lastScan.importedFiles} 个媒体文件，记录 {lastScan.recordedDirectories} 个目录，短视频过滤 {lastScan.skippedShortFiles} 个
+              </p>
+              <button type="button" className="skip-list-toggle" disabled={isLoadingSkips || isScanning} onClick={showScanSkips}>
+                {isLoadingSkips ? "读取中" : "查看跳过清单"}
+              </button>
+            </div>
+          ) : null}
+          {skipListVisible ? (
+            <div className="skip-list">
+              <div className="skip-list-header">
+                <strong>跳过清单</strong>
+                <span>不包含短视频过滤项</span>
+              </div>
+              {scanSkips.length === 0 ? <p className="muted">没有非短视频跳过项。</p> : null}
+              {scanSkips.map((item) => (
+                <div className="skip-item" key={item.id}>
+                  <div>
+                    <strong>{item.fileName}</strong>
+                    <span>{skipReasonLabel(item.reason)} · {item.detail}</span>
+                  </div>
+                  <code title={item.path}>{item.path}</code>
+                </div>
+              ))}
+            </div>
           ) : null}
         </section>
       </aside>

@@ -121,6 +121,21 @@ struct ScanProgress {
     ffprobe_missing: bool,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScanSkip {
+    id: i64,
+    path: String,
+    file_name: String,
+    root_path: String,
+    reason: String,
+    detail: String,
+    is_short_video: bool,
+    file_size: Option<i64>,
+    modified_ms: Option<i64>,
+    created_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MergeRequest {
@@ -570,6 +585,7 @@ fn run_scan(
     init_schema(&conn).map_err(|error| error.to_string())?;
     let tx = conn.transaction().map_err(|error| error.to_string())?;
     delete_roots(&tx, &roots_for_cleanup)?;
+    delete_scan_skips_roots(&tx, &roots_for_cleanup)?;
     maybe_emit_scan_progress(
         app,
         "processing",
@@ -608,7 +624,7 @@ fn run_scan(
             "正在调用 ffprobe 分析媒体流",
             scan_started_at_ms,
             Some(current_file_started_at_ms),
-            true,
+            false,
             ffprobe_missing,
             &mut last_emit,
             true,
@@ -628,12 +644,34 @@ fn run_scan(
             Err(AnalyzeSkip::ShortVideo) => {
                 skipped_files += 1;
                 skipped_short_files += 1;
+                record_scan_skip(
+                    &tx,
+                    &path,
+                    &root_path,
+                    "short_video",
+                    "短视频少于 5 分钟，已从媒体库过滤",
+                    true,
+                )?;
             }
             Err(AnalyzeSkip::Other) => {
                 skipped_files += 1;
+                let detail = if ffprobe_missing {
+                    "未找到 ffprobe，无法验证音视频流"
+                } else {
+                    "ffprobe 分析失败、文件损坏、没有音视频流或无法识别"
+                };
+                record_scan_skip(&tx, &path, &root_path, "analysis_failed", detail, false)?;
             }
             Err(AnalyzeSkip::SkippedByUser) => {
                 skipped_files += 1;
+                record_scan_skip(
+                    &tx,
+                    &path,
+                    &root_path,
+                    "manual_skip",
+                    "用户跳过了当前文件",
+                    false,
+                )?;
             }
             Err(AnalyzeSkip::Stopped) => return Err(SCAN_STOPPED_MESSAGE.to_string()),
         }
@@ -747,6 +785,15 @@ fn list_library(db: State<'_, DbState>) -> Result<LibraryData, String> {
         .lock()
         .map_err(|_| "数据库连接被占用，稍后再试".to_string())?;
     load_library(&conn)
+}
+
+#[tauri::command]
+fn list_scan_skips(db: State<'_, DbState>) -> Result<Vec<ScanSkip>, String> {
+    let conn = db
+        .conn
+        .lock()
+        .map_err(|_| "数据库连接被占用，稍后再试".to_string())?;
+    load_scan_skips(&conn, false)
 }
 
 #[tauri::command]
@@ -1708,6 +1755,106 @@ fn delete_roots(conn: &Connection, roots: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn delete_scan_skips_roots(conn: &Connection, roots: &[String]) -> Result<(), String> {
+    for root in roots {
+        conn.execute("DELETE FROM scan_skips WHERE root_path = ?1", params![root])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn record_scan_skip(
+    conn: &Connection,
+    path: &Path,
+    root_path: &Path,
+    reason: &str,
+    detail: &str,
+    is_short_video: bool,
+) -> Result<(), String> {
+    let metadata = fs::metadata(path).ok();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let path_string = path.to_string_lossy().to_string();
+    let root_string = root_path.to_string_lossy().to_string();
+    let file_size = metadata.as_ref().map(|metadata| metadata.len() as i64);
+    let modified_ms = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64);
+
+    conn.execute(
+        r#"
+        INSERT INTO scan_skips (
+          path, file_name, root_path, reason, detail, is_short_video, file_size, modified_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(path) DO UPDATE SET
+          file_name = excluded.file_name,
+          root_path = excluded.root_path,
+          reason = excluded.reason,
+          detail = excluded.detail,
+          is_short_video = excluded.is_short_video,
+          file_size = excluded.file_size,
+          modified_ms = excluded.modified_ms,
+          updated_at = CURRENT_TIMESTAMP
+        "#,
+        params![
+            path_string,
+            file_name,
+            root_string,
+            reason,
+            detail,
+            if is_short_video { 1 } else { 0 },
+            file_size,
+            modified_ms
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn load_scan_skips(conn: &Connection, include_short_video: bool) -> Result<Vec<ScanSkip>, String> {
+    let mut sql = String::from(
+        r#"
+        SELECT id, path, file_name, root_path, reason, detail, is_short_video,
+               file_size, modified_ms, created_at
+        FROM scan_skips
+        "#,
+    );
+    if !include_short_video {
+        sql.push_str("WHERE is_short_video = 0 ");
+    }
+    sql.push_str("ORDER BY root_path COLLATE NOCASE, path COLLATE NOCASE");
+
+    let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ScanSkip {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                file_name: row.get(2)?,
+                root_path: row.get(3)?,
+                reason: row.get(4)?,
+                detail: row.get(5)?,
+                is_short_video: row.get::<_, i64>(6)? != 0,
+                file_size: row.get(7)?,
+                modified_ms: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut skips = Vec::new();
+    for row in rows {
+        skips.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(skips)
+}
+
 fn load_library(conn: &Connection) -> Result<LibraryData, String> {
     let music_artist_rules = load_merge_rules(conn, "music_artist")?;
     let video_series_rules = load_merge_rules(conn, "video_series")?;
@@ -2166,10 +2313,26 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
       PRIMARY KEY (kind, source_key)
     );
 
+    CREATE TABLE IF NOT EXISTS scan_skips (
+      id INTEGER PRIMARY KEY,
+      path TEXT NOT NULL UNIQUE,
+      file_name TEXT NOT NULL,
+      root_path TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      detail TEXT NOT NULL,
+      is_short_video INTEGER NOT NULL DEFAULT 0,
+      file_size INTEGER,
+      modified_ms INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE INDEX IF NOT EXISTS idx_media_files_item_key ON media_files(item_key);
     CREATE INDEX IF NOT EXISTS idx_media_files_title ON media_files(title_guess);
     CREATE INDEX IF NOT EXISTS idx_media_files_root ON media_files(root_path);
     CREATE INDEX IF NOT EXISTS idx_merge_rules_kind ON merge_rules(kind);
+    CREATE INDEX IF NOT EXISTS idx_scan_skips_root ON scan_skips(root_path);
+    CREATE INDEX IF NOT EXISTS idx_scan_skips_short ON scan_skips(is_short_video);
     "#,
     )?;
 
@@ -2416,6 +2579,7 @@ pub fn run() {
             check_ffprobe,
             start_scan,
             list_library,
+            list_scan_skips,
             set_merge_rules,
             stop_scan,
             skip_current_file

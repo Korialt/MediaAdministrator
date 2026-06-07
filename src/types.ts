@@ -64,6 +64,19 @@ export type ScanSummary = {
   library: LibraryData;
 };
 
+export type ScanSkip = {
+  id: number;
+  path: string;
+  fileName: string;
+  rootPath: string;
+  reason: string;
+  detail: string;
+  isShortVideo: boolean;
+  fileSize: number | null;
+  modifiedMs: number | null;
+  createdAt: string;
+};
+
 export type ScanProgress = {
   phase: "discovering" | "processing";
   discoveredFiles: number;
