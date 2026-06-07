@@ -13,7 +13,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{webview::PageLoadEvent, AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
@@ -23,6 +23,7 @@ struct DbState {
     db_path: PathBuf,
     scan_running: Mutex<bool>,
     stop_requested: Arc<AtomicBool>,
+    skip_requested: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -112,6 +113,11 @@ struct ScanProgress {
     skipped_short_files: usize,
     total_files: Option<usize>,
     current_path: Option<String>,
+    detail: String,
+    scan_started_at_ms: i64,
+    current_file_started_at_ms: Option<i64>,
+    updated_at_ms: i64,
+    can_skip_current_file: bool,
     ffprobe_missing: bool,
 }
 
@@ -180,6 +186,7 @@ enum AnalyzeSkip {
     Other,
     ShortVideo,
     Stopped,
+    SkippedByUser,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +225,7 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "ape"];
 const MIN_VIDEO_SECONDS: f64 = 300.0;
 const SCAN_STOPPED_MESSAGE: &str = "扫描已停止";
+const SKIP_FILE_MESSAGE: &str = "已跳过当前文件";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -238,12 +246,21 @@ fn ffprobe_command() -> Command {
 fn command_output(
     command: &mut Command,
     stop_requested: Option<&AtomicBool>,
+    skip_requested: Option<&AtomicBool>,
 ) -> Result<Output, String> {
     if let Some(stop_requested) = stop_requested {
         if stop_requested.load(Ordering::SeqCst) {
             return Err(SCAN_STOPPED_MESSAGE.to_string());
         }
-    } else {
+    }
+
+    if let Some(skip_requested) = skip_requested {
+        if skip_requested.load(Ordering::SeqCst) {
+            return Err(SKIP_FILE_MESSAGE.to_string());
+        }
+    }
+
+    if stop_requested.is_none() && skip_requested.is_none() {
         return command.output().map_err(|error| error.to_string());
     }
 
@@ -259,6 +276,14 @@ fn command_output(
             }
         }
 
+        if let Some(skip_requested) = skip_requested {
+            if skip_requested.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SKIP_FILE_MESSAGE.to_string());
+            }
+        }
+
         match child.try_wait() {
             Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
             Ok(None) => thread::sleep(Duration::from_millis(50)),
@@ -268,6 +293,13 @@ fn command_output(
             }
         }
     }
+}
+
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 fn ensure_scan_not_stopped(stop_requested: &AtomicBool) -> Result<(), String> {
@@ -282,7 +314,7 @@ fn ensure_scan_not_stopped(stop_requested: &AtomicBool) -> Result<(), String> {
 fn check_ffprobe() -> Result<String, String> {
     let mut command = ffprobe_command();
     command.arg("-version");
-    match command_output(&mut command, None) {
+    match command_output(&mut command, None, None) {
         Ok(output) if output.status.success() => Ok("ffprobe 已从 PATH 找到".to_string()),
         Ok(_) => Err("ffprobe 可执行文件存在，但版本检查失败".to_string()),
         Err(error) => Err(format!("未能从 PATH 调用 ffprobe：{error}")),
@@ -312,16 +344,19 @@ fn start_scan(
     }
 
     db.stop_requested.store(false, Ordering::SeqCst);
+    db.skip_requested.store(false, Ordering::SeqCst);
     let db_path = db.db_path.clone();
     let app_handle = app.clone();
     let excluded_paths = excluded_paths.unwrap_or_default();
     let stop_requested = Arc::clone(&db.stop_requested);
+    let skip_requested = Arc::clone(&db.skip_requested);
     tauri::async_runtime::spawn_blocking(move || {
         let result = run_scan(
             paths,
             excluded_paths,
             &db_path,
             &stop_requested,
+            &skip_requested,
             Some(&app_handle),
         );
         match result {
@@ -336,6 +371,7 @@ fn start_scan(
         {
             let state = app_handle.state::<DbState>();
             state.stop_requested.store(false, Ordering::SeqCst);
+            state.skip_requested.store(false, Ordering::SeqCst);
             if let Ok(mut running) = state.scan_running.lock() {
                 *running = false;
             };
@@ -351,17 +387,25 @@ fn stop_scan(db: State<'_, DbState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn skip_current_file(db: State<'_, DbState>) -> Result<(), String> {
+    db.skip_requested.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 fn run_scan(
     paths: Vec<String>,
     excluded_paths: Vec<String>,
     db_path: &Path,
     stop_requested: &AtomicBool,
+    skip_requested: &AtomicBool,
     app: Option<&AppHandle>,
 ) -> Result<ScanSummary, String> {
     ensure_scan_not_stopped(stop_requested)?;
     let mut version_command = ffprobe_command();
     version_command.arg("-version");
-    let ffprobe_missing = match command_output(&mut version_command, Some(stop_requested)) {
+    let scan_started_at_ms = current_time_millis();
+    let ffprobe_missing = match command_output(&mut version_command, Some(stop_requested), None) {
         Ok(_) => false,
         Err(error) if error == SCAN_STOPPED_MESSAGE => return Err(error),
         Err(_) => true,
@@ -386,6 +430,10 @@ fn run_scan(
         skipped_short_files,
         None,
         None,
+        "准备统计目录媒体文件",
+        scan_started_at_ms,
+        None,
+        false,
         ffprobe_missing,
         &mut last_emit,
         true,
@@ -406,6 +454,10 @@ fn run_scan(
                 skipped_short_files,
                 None,
                 Some(root),
+                "目录不存在，已跳过",
+                scan_started_at_ms,
+                None,
+                false,
                 ffprobe_missing,
                 &mut last_emit,
                 true,
@@ -430,6 +482,24 @@ fn run_scan(
 
             let path = entry.path();
             if !entry.file_type().is_file() || !is_media_file(path) {
+                maybe_emit_scan_progress(
+                    app,
+                    "discovering",
+                    discovered_files,
+                    processed_files,
+                    imported_files,
+                    skipped_files,
+                    skipped_short_files,
+                    None,
+                    Some(path.to_string_lossy().to_string()),
+                    "正在遍历目录",
+                    scan_started_at_ms,
+                    None,
+                    false,
+                    ffprobe_missing,
+                    &mut last_emit,
+                    false,
+                );
                 continue;
             }
 
@@ -445,6 +515,10 @@ fn run_scan(
                 skipped_short_files,
                 None,
                 Some(path.to_string_lossy().to_string()),
+                "发现媒体文件",
+                scan_started_at_ms,
+                None,
+                false,
                 ffprobe_missing,
                 &mut last_emit,
                 false,
@@ -468,6 +542,10 @@ fn run_scan(
         skipped_short_files,
         Some(total_files),
         None,
+        "开始分析媒体文件",
+        scan_started_at_ms,
+        None,
+        false,
         ffprobe_missing,
         &mut last_emit,
         true,
@@ -475,8 +553,36 @@ fn run_scan(
 
     for (path, root_path) in media_files {
         ensure_scan_not_stopped(stop_requested)?;
+        skip_requested.store(false, Ordering::SeqCst);
         processed_files += 1;
-        match analyze_file(&path, &root_path, !ffprobe_missing, stop_requested) {
+        let current_path = path.to_string_lossy().to_string();
+        let current_file_started_at_ms = current_time_millis();
+        maybe_emit_scan_progress(
+            app,
+            "processing",
+            discovered_files,
+            processed_files,
+            imported_files,
+            skipped_files,
+            skipped_short_files,
+            Some(total_files),
+            Some(current_path.clone()),
+            "正在调用 ffprobe 分析媒体流",
+            scan_started_at_ms,
+            Some(current_file_started_at_ms),
+            true,
+            ffprobe_missing,
+            &mut last_emit,
+            true,
+        );
+
+        match analyze_file(
+            &path,
+            &root_path,
+            !ffprobe_missing,
+            stop_requested,
+            skip_requested,
+        ) {
             Ok(file) => {
                 upsert_file(&tx, &file)?;
                 imported_files += 1;
@@ -488,9 +594,13 @@ fn run_scan(
             Err(AnalyzeSkip::Other) => {
                 skipped_files += 1;
             }
+            Err(AnalyzeSkip::SkippedByUser) => {
+                skipped_files += 1;
+            }
             Err(AnalyzeSkip::Stopped) => return Err(SCAN_STOPPED_MESSAGE.to_string()),
         }
 
+        skip_requested.store(false, Ordering::SeqCst);
         maybe_emit_scan_progress(
             app,
             "processing",
@@ -500,7 +610,11 @@ fn run_scan(
             skipped_files,
             skipped_short_files,
             Some(total_files),
-            Some(path.to_string_lossy().to_string()),
+            Some(current_path),
+            "当前文件处理完成",
+            scan_started_at_ms,
+            None,
+            false,
             ffprobe_missing,
             &mut last_emit,
             false,
@@ -517,6 +631,10 @@ fn run_scan(
         skipped_short_files,
         Some(total_files),
         None,
+        "分析完成，正在提交数据库",
+        scan_started_at_ms,
+        None,
+        false,
         ffprobe_missing,
         &mut last_emit,
         true,
@@ -549,6 +667,10 @@ fn maybe_emit_scan_progress(
     skipped_short_files: usize,
     total_files: Option<usize>,
     current_path: Option<String>,
+    detail: &str,
+    scan_started_at_ms: i64,
+    current_file_started_at_ms: Option<i64>,
+    can_skip_current_file: bool,
     ffprobe_missing: bool,
     last_emit: &mut Instant,
     force: bool,
@@ -567,6 +689,11 @@ fn maybe_emit_scan_progress(
             skipped_short_files,
             total_files,
             current_path,
+            detail: detail.to_string(),
+            scan_started_at_ms,
+            current_file_started_at_ms,
+            updated_at_ms: current_time_millis(),
+            can_skip_current_file,
             ffprobe_missing,
         };
         let _ = app.emit("scan-progress", progress);
@@ -639,6 +766,7 @@ fn analyze_file(
     root_path: &Path,
     use_ffprobe: bool,
     stop_requested: &AtomicBool,
+    skip_requested: &AtomicBool,
 ) -> Result<AnalyzedFile, AnalyzeSkip> {
     if stop_requested.load(Ordering::SeqCst) {
         return Err(AnalyzeSkip::Stopped);
@@ -652,9 +780,11 @@ fn analyze_file(
         .to_string();
     let parsed = parse_name(&file_name);
     let probe = if use_ffprobe {
-        probe_media(path, stop_requested).map_err(|error| {
+        probe_media(path, stop_requested, skip_requested).map_err(|error| {
             if error == SCAN_STOPPED_MESSAGE {
                 AnalyzeSkip::Stopped
+            } else if error == SKIP_FILE_MESSAGE {
+                AnalyzeSkip::SkippedByUser
             } else {
                 AnalyzeSkip::Other
             }
@@ -737,7 +867,11 @@ fn is_short_video(probe: &MediaProbe) -> bool {
             .unwrap_or(false)
 }
 
-fn probe_media(path: &Path, stop_requested: &AtomicBool) -> Result<MediaProbe, String> {
+fn probe_media(
+    path: &Path,
+    stop_requested: &AtomicBool,
+    skip_requested: &AtomicBool,
+) -> Result<MediaProbe, String> {
     let mut command = ffprobe_command();
     command
         .args([
@@ -749,7 +883,7 @@ fn probe_media(path: &Path, stop_requested: &AtomicBool) -> Result<MediaProbe, S
             "-show_streams",
         ])
         .arg(path);
-    let output = command_output(&mut command, Some(stop_requested))?;
+    let output = command_output(&mut command, Some(stop_requested), Some(skip_requested))?;
 
     if !output.status.success() {
         return Err("ffprobe 分析失败".to_string());
@@ -2032,9 +2166,22 @@ fn add_column_if_missing(
 }
 
 fn setup_database(app: &tauri::AppHandle) -> Result<DbState, Box<dyn std::error::Error>> {
-    let app_data_dir = app.path().app_data_dir()?;
-    fs::create_dir_all(&app_data_dir)?;
-    let db_path = app_data_dir.join("media_administrator.sqlite3");
+    let db_dir = std::env::current_exe()?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir()?);
+    fs::create_dir_all(&db_dir)?;
+    let db_path = db_dir.join("media_administrator.sqlite3");
+
+    if !db_path.exists() {
+        if let Ok(app_data_dir) = app.path().app_data_dir() {
+            let old_db_path = app_data_dir.join("media_administrator.sqlite3");
+            if old_db_path.exists() {
+                let _ = fs::copy(old_db_path, &db_path);
+            }
+        }
+    }
+
     let conn = Connection::open(&db_path)?;
     init_schema(&conn)?;
     Ok(DbState {
@@ -2042,6 +2189,7 @@ fn setup_database(app: &tauri::AppHandle) -> Result<DbState, Box<dyn std::error:
         db_path,
         scan_running: Mutex::new(false),
         stop_requested: Arc::new(AtomicBool::new(false)),
+        skip_requested: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -2231,7 +2379,8 @@ pub fn run() {
             start_scan,
             list_library,
             set_merge_rules,
-            stop_scan
+            stop_scan,
+            skip_current_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

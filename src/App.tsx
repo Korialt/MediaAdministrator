@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { LibraryData, MediaDirectory, MediaGroup, ResourceVariant, ScanProgress, ScanSummary } from "./types";
 
 const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [], musicArtists: [], videoSeries: [] };
@@ -53,6 +53,32 @@ function scanStatusText(progress: ScanProgress): string {
 function progressPercent(progress: ScanProgress | null): number | null {
   if (!progress || progress.phase !== "processing" || !progress.totalFiles) return null;
   return Math.min(100, Math.round((progress.processedFiles / progress.totalFiles) * 100));
+}
+
+function formatElapsedMs(milliseconds: number | null): string {
+  if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds < 0) return "-";
+  const totalSeconds = Math.floor(milliseconds / 1000);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  if (h > 0) return `${h}时${m.toString().padStart(2, "0")}分${s.toString().padStart(2, "0")}秒`;
+  if (m > 0) return `${m}分${s.toString().padStart(2, "0")}秒`;
+  return `${s}秒`;
+}
+
+function formatClock(milliseconds: number | null): string {
+  if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds <= 0) return "-";
+  return new Date(milliseconds).toLocaleTimeString();
+}
+
+function phaseLabel(phase: ScanProgress["phase"]): string {
+  return phase === "discovering" ? "统计文件" : "分析媒体";
+}
+
+function processingSpeed(progress: ScanProgress | null, nowMs: number): string {
+  if (!progress || progress.processedFiles === 0) return "-";
+  const elapsedSeconds = Math.max(1, (nowMs - progress.scanStartedAtMs) / 1000);
+  return `${(progress.processedFiles / elapsedSeconds).toFixed(2)} 个/秒`;
 }
 
 function directoryMatches(directory: MediaDirectory, query: string): boolean {
@@ -315,6 +341,7 @@ export default function App() {
   const [status, setStatus] = useState("正在检查 ffprobe...");
   const [isScanning, setIsScanning] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [isSkippingCurrent, setIsSkippingCurrent] = useState(false);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
@@ -322,6 +349,8 @@ export default function App() {
   const [activeEntry, setActiveEntry] = useState<ActiveEntry>("home");
   const [musicBrowseMode, setMusicBrowseMode] = useState<MusicBrowseMode>("directory");
   const [videoBrowseMode, setVideoBrowseMode] = useState<VideoBrowseMode>("directory");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const scanStartedAtRef = useRef<number | null>(null);
 
   async function refreshLibrary() {
     const data = await invoke<LibraryData>("list_library");
@@ -331,6 +360,12 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  useEffect(() => {
+    if (!isScanning) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isScanning]);
 
   useEffect(() => {
     invoke<string>("check_ffprobe")
@@ -348,7 +383,10 @@ export default function App() {
     listen<ScanProgress>("scan-progress", (event) => {
       const progress = event.payload;
       setIsScanning(true);
+      setNowMs(Date.now());
+      scanStartedAtRef.current = progress.scanStartedAtMs;
       setScanProgress(progress);
+      setIsSkippingCurrent(false);
       setStatus(scanStatusText(progress));
     }).then((unlisten) => {
       if (disposed) unlisten();
@@ -361,6 +399,10 @@ export default function App() {
       setLibrary(summary.library);
       setIsScanning(false);
       setIsStopping(false);
+      setIsSkippingCurrent(false);
+      const completedAtMs = Date.now();
+      const scanStartedAtMs = scanStartedAtRef.current ?? completedAtMs;
+      setNowMs(completedAtMs);
       setScanProgress({
         phase: "processing",
         discoveredFiles: summary.scannedFiles,
@@ -370,6 +412,11 @@ export default function App() {
         skippedShortFiles: summary.skippedShortFiles,
         totalFiles: summary.scannedFiles,
         currentPath: null,
+        detail: "扫描完成",
+        scanStartedAtMs,
+        currentFileStartedAtMs: null,
+        updatedAtMs: completedAtMs,
+        canSkipCurrentFile: false,
         ffprobeMissing: summary.ffprobeMissing,
       });
       setStatus(summary.ffprobeMissing ? "扫描完成，但没有找到 ffprobe，短视频过滤可能不完整" : "扫描完成");
@@ -381,6 +428,8 @@ export default function App() {
     listen<string>("scan-error", (event) => {
       setIsScanning(false);
       setIsStopping(false);
+      setIsSkippingCurrent(false);
+      scanStartedAtRef.current = null;
       setStatus(String(event.payload));
       refreshLibrary().catch((error) => setStatus(String(error)));
     }).then((unlisten) => {
@@ -426,8 +475,12 @@ export default function App() {
 
   async function scan() {
     if (paths.length === 0) return;
+    const startedAtMs = Date.now();
     setIsScanning(true);
     setIsStopping(false);
+    setIsSkippingCurrent(false);
+    setNowMs(startedAtMs);
+    scanStartedAtRef.current = startedAtMs;
     setScanProgress({
       phase: "discovering",
       discoveredFiles: 0,
@@ -437,6 +490,11 @@ export default function App() {
       skippedShortFiles: 0,
       totalFiles: null,
       currentPath: null,
+      detail: "准备启动后台扫描",
+      scanStartedAtMs: startedAtMs,
+      currentFileStartedAtMs: null,
+      updatedAtMs: startedAtMs,
+      canSkipCurrentFile: false,
       ffprobeMissing: false,
     });
     setStatus("后台扫描已启动...");
@@ -450,11 +508,23 @@ export default function App() {
 
   async function stopScan() {
     setIsStopping(true);
+    setIsSkippingCurrent(false);
     setStatus("正在停止扫描...");
     try {
       await invoke<void>("stop_scan");
     } catch (error) {
       setIsStopping(false);
+      setStatus(String(error));
+    }
+  }
+
+  async function skipCurrentFile() {
+    setIsSkippingCurrent(true);
+    setStatus("正在跳过当前文件...");
+    try {
+      await invoke<void>("skip_current_file");
+    } catch (error) {
+      setIsSkippingCurrent(false);
       setStatus(String(error));
     }
   }
@@ -504,6 +574,9 @@ export default function App() {
   }, [library]);
 
   const percent = progressPercent(scanProgress);
+  const scanElapsedMs = scanProgress ? nowMs - scanProgress.scanStartedAtMs : null;
+  const currentFileElapsedMs = scanProgress?.currentFileStartedAtMs ? nowMs - scanProgress.currentFileStartedAtMs : null;
+  const lastProgressAgeMs = scanProgress ? nowMs - scanProgress.updatedAtMs : null;
   const activeBrowseMode = activeEntry === "music" ? musicBrowseMode : videoBrowseMode;
   const activeTitle =
     activeEntry === "music"
@@ -611,9 +684,50 @@ export default function App() {
                 <span>发现 {scanProgress.discoveredFiles}</span>
                 <span>已处理 {scanProgress.processedFiles}</span>
                 <span>已入库 {scanProgress.importedFiles}</span>
+                <span>已跳过 {scanProgress.skippedFiles}</span>
                 <span>短视频过滤 {scanProgress.skippedShortFiles}</span>
               </div>
-              {scanProgress.currentPath ? <code className="current-path">{scanProgress.currentPath}</code> : null}
+              <div className="progress-detail">
+                <div>
+                  <span>阶段</span>
+                  <strong>{phaseLabel(scanProgress.phase)}</strong>
+                </div>
+                <div>
+                  <span>当前动作</span>
+                  <strong>{scanProgress.detail}</strong>
+                </div>
+                <div>
+                  <span>当前文件耗时</span>
+                  <strong>{formatElapsedMs(currentFileElapsedMs)}</strong>
+                </div>
+                <div>
+                  <span>总耗时</span>
+                  <strong>{formatElapsedMs(scanElapsedMs)}</strong>
+                </div>
+                <div>
+                  <span>最近更新</span>
+                  <strong>{formatElapsedMs(lastProgressAgeMs)}前 · {formatClock(scanProgress.updatedAtMs)}</strong>
+                </div>
+                <div>
+                  <span>处理速度</span>
+                  <strong>{processingSpeed(scanProgress, nowMs)}</strong>
+                </div>
+                <div>
+                  <span>ffprobe</span>
+                  <strong>{scanProgress.ffprobeMissing ? "未找到" : "可用"}</strong>
+                </div>
+              </div>
+              {scanProgress.currentPath ? (
+                <div className="current-file">
+                  <span>当前路径</span>
+                  <code title={scanProgress.currentPath}>{scanProgress.currentPath}</code>
+                </div>
+              ) : null}
+              {scanProgress.canSkipCurrentFile ? (
+                <button type="button" className="skip-current" disabled={isSkippingCurrent || isStopping} onClick={skipCurrentFile}>
+                  {isSkippingCurrent ? "跳过中" : "跳过当前文件"}
+                </button>
+              ) : null}
             </div>
           ) : null}
           {lastScan ? (

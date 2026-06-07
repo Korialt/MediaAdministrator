@@ -73,5 +73,10 @@ export type ScanProgress = {
   skippedShortFiles: number;
   totalFiles: number | null;
   currentPath: string | null;
+  detail: string;
+  scanStartedAtMs: number;
+  currentFileStartedAtMs: number | null;
+  updatedAtMs: number;
+  canSkipCurrentFile: boolean;
   ffprobeMissing: boolean;
 };

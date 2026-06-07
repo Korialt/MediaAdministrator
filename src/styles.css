@@ -259,6 +259,50 @@ button.danger {
   font-size: 12px;
 }
 
+.progress-detail {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface-alt);
+  padding: 9px 10px;
+}
+
+.progress-detail div,
+.current-file {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.progress-detail span,
+.current-file span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.progress-detail strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.current-file code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.skip-current {
+  width: 100%;
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
 .current-path {
   max-width: 100%;
 }
