@@ -55,13 +55,37 @@ export type LibraryData = {
 };
 
 export type ScanSummary = {
+  scanId: number;
+  startedAtMs: number;
+  completedAtMs: number;
+  durationMs: number;
   scannedFiles: number;
   importedFiles: number;
   skippedFiles: number;
   skippedShortFiles: number;
   recordedDirectories: number;
   ffprobeMissing: boolean;
-  library: LibraryData;
+};
+
+export type ScanRun = {
+  id: number;
+  startedAtMs: number;
+  completedAtMs: number;
+  durationMs: number;
+  scannedFiles: number;
+  importedFiles: number;
+  skippedFiles: number;
+  skippedShortFiles: number;
+  recordedDirectories: number;
+  ffprobeMissing: boolean;
+  paths: string[];
+  excludedPaths: string[];
+  createdAt: string;
+};
+
+export type ScanConfig = {
+  paths: string[];
+  excludedPaths: string[];
 };
 
 export type ScanSkip = {

@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { LibraryData, MediaDirectory, MediaGroup, ResourceVariant, ScanProgress, ScanSkip, ScanSummary } from "./types";
+import type { LibraryData, MediaDirectory, MediaGroup, ResourceVariant, ScanConfig, ScanProgress, ScanRun, ScanSkip, ScanSummary } from "./types";
 
 const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [], musicArtists: [], videoSeries: [] };
 
@@ -69,6 +69,11 @@ function formatElapsedMs(milliseconds: number | null): string {
 function formatClock(milliseconds: number | null): string {
   if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds <= 0) return "-";
   return new Date(milliseconds).toLocaleTimeString();
+}
+
+function formatDateTime(milliseconds: number | null): string {
+  if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds <= 0) return "-";
+  return new Date(milliseconds).toLocaleString();
 }
 
 function phaseLabel(phase: ScanProgress["phase"]): string {
@@ -156,8 +161,10 @@ function FileRows({ files }: { files: ResourceVariant[] }) {
 }
 
 function DirectoryItem({ directory, mode }: { directory: MediaDirectory; mode: ViewMode }) {
+  const [open, setOpen] = useState(false);
+
   return (
-    <details className={mode === "grid" ? "directory-card" : "directory-row"}>
+    <details className={mode === "grid" ? "directory-card" : "directory-row"} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <div className="directory-main">
           <strong>{directoryTitle(directory)}</strong>
@@ -168,7 +175,7 @@ function DirectoryItem({ directory, mode }: { directory: MediaDirectory; mode: V
           {directory.fileCount} 个文件 · {formatBytes(directory.totalSize)}
         </b>
       </summary>
-      <FileRows files={directory.files} />
+      {open ? <FileRows files={directory.files} /> : null}
     </details>
   );
 }
@@ -214,9 +221,10 @@ function MergeControls({ group, mergeKind, onMerge }: { group: MediaGroup; merge
 
 function GroupItem({ group, mode, mergeKind, onMerge, nested = false }: { group: MediaGroup; mode: ViewMode; mergeKind: MergeKind; onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void>; nested?: boolean }) {
   const hasChildren = group.childGroups.length > 0;
+  const [open, setOpen] = useState(false);
 
   return (
-    <details className={`${mode === "grid" && !nested ? "directory-card" : "directory-row"}${nested ? " nested-group" : ""}`}>
+    <details className={`${mode === "grid" && !nested ? "directory-card" : "directory-row"}${nested ? " nested-group" : ""}`} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <div className="directory-main">
           <strong>{group.name}</strong>
@@ -227,16 +235,15 @@ function GroupItem({ group, mode, mergeKind, onMerge, nested = false }: { group:
           {group.fileCount} 个文件 · {formatBytes(group.totalSize)}
         </b>
       </summary>
-      <MergeControls group={group} mergeKind={mergeKind} onMerge={onMerge} />
-      {hasChildren ? (
+      {open ? <MergeControls group={group} mergeKind={mergeKind} onMerge={onMerge} /> : null}
+      {open && hasChildren ? (
         <div className="child-group-list">
           {group.childGroups.map((child) => (
             <GroupItem group={child} key={child.key} mode="list" mergeKind={mergeKind} onMerge={onMerge} nested />
           ))}
         </div>
-      ) : (
-        <FileRows files={group.files} />
-      )}
+      ) : null}
+      {open && !hasChildren ? <FileRows files={group.files} /> : null}
     </details>
   );
 }
@@ -348,9 +355,13 @@ export default function App() {
   const [status, setStatus] = useState("正在检查 ffprobe...");
   const [isScanning, setIsScanning] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [isLoadingLibrary, setIsLoadingLibrary] = useState(false);
   const [isLoadingSkips, setIsLoadingSkips] = useState(false);
   const [skipListVisible, setSkipListVisible] = useState(false);
   const [scanSkips, setScanSkips] = useState<ScanSkip[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [scanHistoryVisible, setScanHistoryVisible] = useState(false);
+  const [scanHistory, setScanHistory] = useState<ScanRun[]>([]);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [lastScan, setLastScan] = useState<ScanSummary | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
@@ -361,9 +372,23 @@ export default function App() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const scanStartedAtRef = useRef<number | null>(null);
 
-  async function refreshLibrary() {
-    const data = await invoke<LibraryData>("list_library");
-    setLibrary(data);
+  async function refreshLibrary(successStatus?: string) {
+    setIsLoadingLibrary(true);
+    try {
+      const data = await invoke<LibraryData>("list_library");
+      setLibrary(data);
+      if (successStatus) setStatus(successStatus);
+    } catch (error) {
+      setStatus(String(error));
+    } finally {
+      setIsLoadingLibrary(false);
+    }
+  }
+
+  async function loadLastScanConfig() {
+    const config = await invoke<ScanConfig>("get_last_scan_config");
+    if (config.paths.length > 0) setPaths(config.paths);
+    setExcludedPaths(config.excludedPaths);
   }
 
   useEffect(() => {
@@ -380,7 +405,8 @@ export default function App() {
     invoke<string>("check_ffprobe")
       .then((message) => setStatus(message))
       .catch((error) => setStatus(String(error)));
-    refreshLibrary().catch((error) => setStatus(String(error)));
+    loadLastScanConfig().catch((error) => setStatus(String(error)));
+    void refreshLibrary();
   }, []);
 
   useEffect(() => {
@@ -403,14 +429,16 @@ export default function App() {
 
     listen<ScanSummary>("scan-complete", (event) => {
       const summary = event.payload;
+      const completionStatus = summary.ffprobeMissing ? "扫描完成，但没有找到 ffprobe，短视频过滤可能不完整" : "扫描完成";
       setLastScan(summary);
-      setLibrary(summary.library);
       setIsScanning(false);
       setIsStopping(false);
       setSkipListVisible(false);
       setScanSkips([]);
-      const completedAtMs = Date.now();
-      const scanStartedAtMs = scanStartedAtRef.current ?? completedAtMs;
+      setScanHistoryVisible(false);
+      setScanHistory([]);
+      const completedAtMs = summary.completedAtMs || Date.now();
+      const scanStartedAtMs = summary.startedAtMs || scanStartedAtRef.current || completedAtMs;
       setNowMs(completedAtMs);
       setScanProgress({
         phase: "processing",
@@ -428,7 +456,8 @@ export default function App() {
         canSkipCurrentFile: false,
         ffprobeMissing: summary.ffprobeMissing,
       });
-      setStatus(summary.ffprobeMissing ? "扫描完成，但没有找到 ffprobe，短视频过滤可能不完整" : "扫描完成");
+      setStatus(`${completionStatus}，正在后台刷新媒体库...`);
+      void refreshLibrary(completionStatus);
     }).then((unlisten) => {
       if (disposed) unlisten();
       else unlistenComplete = unlisten;
@@ -439,7 +468,7 @@ export default function App() {
       setIsStopping(false);
       scanStartedAtRef.current = null;
       setStatus(String(event.payload));
-      refreshLibrary().catch((error) => setStatus(String(error)));
+      void refreshLibrary();
     }).then((unlisten) => {
       if (disposed) unlisten();
       else unlistenError = unlisten;
@@ -489,6 +518,8 @@ export default function App() {
     setLastScan(null);
     setSkipListVisible(false);
     setScanSkips([]);
+    setScanHistoryVisible(false);
+    setScanHistory([]);
     setNowMs(startedAtMs);
     scanStartedAtRef.current = startedAtMs;
     setScanProgress({
@@ -539,6 +570,21 @@ export default function App() {
       setStatus(String(error));
     } finally {
       setIsLoadingSkips(false);
+    }
+  }
+
+  async function showScanHistory() {
+    setIsLoadingHistory(true);
+    setStatus("正在读取扫描历史...");
+    try {
+      const runs = await invoke<ScanRun[]>("list_scan_history");
+      setScanHistory(runs);
+      setScanHistoryVisible(true);
+      setStatus(runs.length > 0 ? `已加载 ${runs.length} 条扫描历史` : "没有扫描历史记录");
+    } catch (error) {
+      setStatus(String(error));
+    } finally {
+      setIsLoadingHistory(false);
     }
   }
 
@@ -688,6 +734,7 @@ export default function App() {
         <section className="panel">
           <div className="panel-title">状态</div>
           <p className="status">{status}</p>
+          {isLoadingLibrary ? <p className="muted">媒体库正在后台读取...</p> : null}
           {scanProgress ? (
             <div className="progress-block">
               <div className="progress-bar" data-indeterminate={percent == null && isScanning ? "true" : "false"}>
@@ -741,13 +788,18 @@ export default function App() {
           {lastScan ? (
             <div className="last-scan-block">
               <p className="muted">
-                最近扫描：入库 {lastScan.importedFiles} 个媒体文件，记录 {lastScan.recordedDirectories} 个目录，短视频过滤 {lastScan.skippedShortFiles} 个
+                最近扫描：入库 {lastScan.importedFiles} 个媒体文件，记录 {lastScan.recordedDirectories} 个目录，短视频过滤 {lastScan.skippedShortFiles} 个，用时 {formatElapsedMs(lastScan.durationMs)}
               </p>
               <button type="button" className="skip-list-toggle" disabled={isLoadingSkips || isScanning} onClick={showScanSkips}>
                 {isLoadingSkips ? "读取中" : "查看跳过清单"}
               </button>
             </div>
           ) : null}
+          <div className="side-action-row">
+            <button type="button" className="skip-list-toggle" disabled={isLoadingHistory || isScanning} onClick={showScanHistory}>
+              {isLoadingHistory ? "读取中" : "查看扫描历史"}
+            </button>
+          </div>
           {skipListVisible ? (
             <div className="skip-list">
               <div className="skip-list-header">
@@ -762,6 +814,27 @@ export default function App() {
                     <span>{skipReasonLabel(item.reason)} · {item.detail}</span>
                   </div>
                   <code title={item.path}>{item.path}</code>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {scanHistoryVisible ? (
+            <div className="scan-history">
+              <div className="scan-history-header">
+                <strong>扫描历史</strong>
+                <span>最近 {scanHistory.length} 条</span>
+              </div>
+              {scanHistory.length === 0 ? <p className="muted">没有扫描历史记录。</p> : null}
+              {scanHistory.map((run) => (
+                <div className="scan-run" key={run.id}>
+                  <div>
+                    <strong>{formatDateTime(run.completedAtMs)}</strong>
+                    <span>
+                      入库 {run.importedFiles} · 跳过 {run.skippedFiles} · 短视频 {run.skippedShortFiles} · 目录 {run.recordedDirectories} · 用时 {formatElapsedMs(run.durationMs)} · ffprobe {run.ffprobeMissing ? "未找到" : "可用"}
+                    </span>
+                  </div>
+                  <code title={run.paths.join("\\n")}>扫描目录：{run.paths.join(" | ") || "-"}</code>
+                  {run.excludedPaths.length > 0 ? <code title={run.excludedPaths.join("\\n")}>排除目录：{run.excludedPaths.join(" | ")}</code> : null}
                 </div>
               ))}
             </div>

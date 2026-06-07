@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -19,7 +19,6 @@ use tauri::{webview::PageLoadEvent, AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 
 struct DbState {
-    conn: Mutex<Connection>,
     db_path: PathBuf,
     scan_running: Mutex<bool>,
     stop_requested: Arc<AtomicBool>,
@@ -93,13 +92,41 @@ struct LibraryData {
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ScanSummary {
+    scan_id: i64,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    duration_ms: i64,
     scanned_files: usize,
     imported_files: usize,
     skipped_files: usize,
     skipped_short_files: usize,
     recorded_directories: usize,
     ffprobe_missing: bool,
-    library: LibraryData,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScanRun {
+    id: i64,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    duration_ms: i64,
+    scanned_files: i64,
+    imported_files: i64,
+    skipped_files: i64,
+    skipped_short_files: i64,
+    recorded_directories: i64,
+    ffprobe_missing: bool,
+    paths: Vec<String>,
+    excluded_paths: Vec<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScanConfig {
+    paths: Vec<String>,
+    excluded_paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -718,18 +745,23 @@ fn run_scan(
 
     ensure_scan_not_stopped(stop_requested)?;
     tx.commit().map_err(|error| error.to_string())?;
-    let library = load_library(&conn)?;
-    let recorded_directories = library.music_directories.len() + library.video_directories.len();
-
-    Ok(ScanSummary {
+    let recorded_directories = count_recorded_directories(&conn)?;
+    let completed_at_ms = current_time_millis();
+    let duration_ms = (completed_at_ms - scan_started_at_ms).max(0);
+    let mut summary = ScanSummary {
+        scan_id: 0,
+        started_at_ms: scan_started_at_ms,
+        completed_at_ms,
+        duration_ms,
         scanned_files: processed_files,
         imported_files,
         skipped_files,
         skipped_short_files,
         recorded_directories,
         ffprobe_missing,
-        library,
-    })
+    };
+    summary.scan_id = record_scan_run(&conn, &summary, &roots_for_cleanup, &excluded_paths)?;
+    Ok(summary)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -779,71 +811,107 @@ fn maybe_emit_scan_progress(
 }
 
 #[tauri::command]
-fn list_library(db: State<'_, DbState>) -> Result<LibraryData, String> {
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| "数据库连接被占用，稍后再试".to_string())?;
-    load_library(&conn)
+async fn list_library(db: State<'_, DbState>) -> Result<LibraryData, String> {
+    let db_path = db.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+        init_schema(&conn).map_err(|error| error.to_string())?;
+        load_library(&conn)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn list_scan_skips(db: State<'_, DbState>) -> Result<Vec<ScanSkip>, String> {
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| "数据库连接被占用，稍后再试".to_string())?;
-    load_scan_skips(&conn, false)
+async fn list_scan_skips(db: State<'_, DbState>) -> Result<Vec<ScanSkip>, String> {
+    let db_path = db.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+        init_schema(&conn).map_err(|error| error.to_string())?;
+        load_scan_skips(&conn, false)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn set_merge_rules(request: MergeRequest, db: State<'_, DbState>) -> Result<LibraryData, String> {
+async fn list_scan_history(db: State<'_, DbState>) -> Result<Vec<ScanRun>, String> {
+    let db_path = db.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+        init_schema(&conn).map_err(|error| error.to_string())?;
+        load_scan_history(&conn, 50)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn get_last_scan_config(db: State<'_, DbState>) -> Result<ScanConfig, String> {
+    let db_path = db.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+        init_schema(&conn).map_err(|error| error.to_string())?;
+        load_last_scan_config(&conn)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn set_merge_rules(
+    request: MergeRequest,
+    db: State<'_, DbState>,
+) -> Result<LibraryData, String> {
     if !matches!(request.kind.as_str(), "music_artist" | "video_series") {
         return Err("不支持的合并类型".to_string());
     }
 
-    let mut source_keys: Vec<String> = Vec::new();
-    for key in request.source_keys {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() && !source_keys.iter().any(|existing| existing == trimmed) {
-            source_keys.push(trimmed.to_string());
+    let db_path = db.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut source_keys: Vec<String> = Vec::new();
+        for key in request.source_keys {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() && !source_keys.iter().any(|existing| existing == trimmed) {
+                source_keys.push(trimmed.to_string());
+            }
         }
-    }
-    if source_keys.is_empty() {
-        return Err("没有可合并的来源".to_string());
-    }
-
-    let target_name = request.target_name.trim();
-    let conn = db
-        .conn
-        .lock()
-        .map_err(|_| "数据库连接被占用，稍后再试".to_string())?;
-
-    if target_name.is_empty() {
-        for source_key in source_keys {
-            conn.execute(
-                "DELETE FROM merge_rules WHERE kind = ?1 AND source_key = ?2",
-                params![&request.kind, source_key],
-            )
-            .map_err(|error| error.to_string())?;
+        if source_keys.is_empty() {
+            return Err("没有可合并的来源".to_string());
         }
-    } else {
-        for source_key in source_keys {
-            conn.execute(
-                r#"
-                INSERT INTO merge_rules (kind, source_key, target_name)
-                VALUES (?1, ?2, ?3)
-                ON CONFLICT(kind, source_key) DO UPDATE SET
-                  target_name = excluded.target_name,
-                  updated_at = CURRENT_TIMESTAMP
-                "#,
-                params![&request.kind, source_key, target_name],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-    }
 
-    load_library(&conn)
+        let target_name = request.target_name.trim().to_string();
+        let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
+        init_schema(&conn).map_err(|error| error.to_string())?;
+
+        if target_name.is_empty() {
+            for source_key in source_keys {
+                conn.execute(
+                    "DELETE FROM merge_rules WHERE kind = ?1 AND source_key = ?2",
+                    params![&request.kind, source_key],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        } else {
+            for source_key in source_keys {
+                conn.execute(
+                    r#"
+                    INSERT INTO merge_rules (kind, source_key, target_name)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT(kind, source_key) DO UPDATE SET
+                      target_name = excluded.target_name,
+                      updated_at = CURRENT_TIMESTAMP
+                    "#,
+                    params![&request.kind, source_key, &target_name],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+
+        load_library(&conn)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn analyze_file(
@@ -1855,6 +1923,164 @@ fn load_scan_skips(conn: &Connection, include_short_video: bool) -> Result<Vec<S
     Ok(skips)
 }
 
+fn count_recorded_directories(conn: &Connection) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT path, file_name, audio_codec, video_codec, width, height
+            FROM media_files
+            "#,
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut music_dirs: HashSet<String> = HashSet::new();
+    let mut video_dirs: HashSet<String> = HashSet::new();
+    for row in rows {
+        let (path, file_name, audio_codec, video_codec, width, height) =
+            row.map_err(|error| error.to_string())?;
+        let directory = Path::new(&path)
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if directory.is_empty() {
+            continue;
+        }
+
+        if is_audio_file_name(&file_name) {
+            if audio_codec.is_some() {
+                music_dirs.insert(directory);
+            }
+        } else if video_codec.is_some() || width.is_some() || height.is_some() {
+            video_dirs.insert(directory);
+        } else if audio_codec.is_some() {
+            music_dirs.insert(directory);
+        }
+    }
+
+    Ok(music_dirs.len() + video_dirs.len())
+}
+
+fn record_scan_run(
+    conn: &Connection,
+    summary: &ScanSummary,
+    paths: &[String],
+    excluded_paths: &[String],
+) -> Result<i64, String> {
+    let paths_json = serde_json::to_string(paths).map_err(|error| error.to_string())?;
+    let excluded_paths_json =
+        serde_json::to_string(excluded_paths).map_err(|error| error.to_string())?;
+    conn.execute(
+        r#"
+        INSERT INTO scan_runs (
+          started_at_ms, completed_at_ms, duration_ms, scanned_files, imported_files,
+          skipped_files, skipped_short_files, recorded_directories, ffprobe_missing,
+          paths_json, excluded_paths_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+        params![
+            summary.started_at_ms,
+            summary.completed_at_ms,
+            summary.duration_ms,
+            summary.scanned_files as i64,
+            summary.imported_files as i64,
+            summary.skipped_files as i64,
+            summary.skipped_short_files as i64,
+            summary.recorded_directories as i64,
+            if summary.ffprobe_missing { 1 } else { 0 },
+            paths_json,
+            excluded_paths_json
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn parse_string_list_json(value: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+}
+
+fn load_scan_history(conn: &Connection, limit: i64) -> Result<Vec<ScanRun>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, started_at_ms, completed_at_ms, duration_ms, scanned_files,
+                   imported_files, skipped_files, skipped_short_files, recorded_directories,
+                   ffprobe_missing, paths_json, excluded_paths_json, created_at
+            FROM scan_runs
+            ORDER BY completed_at_ms DESC, id DESC
+            LIMIT ?1
+            "#,
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            let paths_json: String = row.get(10)?;
+            let excluded_paths_json: String = row.get(11)?;
+            Ok(ScanRun {
+                id: row.get(0)?,
+                started_at_ms: row.get(1)?,
+                completed_at_ms: row.get(2)?,
+                duration_ms: row.get(3)?,
+                scanned_files: row.get(4)?,
+                imported_files: row.get(5)?,
+                skipped_files: row.get(6)?,
+                skipped_short_files: row.get(7)?,
+                recorded_directories: row.get(8)?,
+                ffprobe_missing: row.get::<_, i64>(9)? != 0,
+                paths: parse_string_list_json(&paths_json),
+                excluded_paths: parse_string_list_json(&excluded_paths_json),
+                created_at: row.get(12)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut runs = Vec::new();
+    for row in rows {
+        runs.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(runs)
+}
+
+fn load_last_scan_config(conn: &Connection) -> Result<ScanConfig, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT paths_json, excluded_paths_json
+            FROM scan_runs
+            ORDER BY completed_at_ms DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
+    if let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let paths_json: String = row.get(0).map_err(|error| error.to_string())?;
+        let excluded_paths_json: String = row.get(1).map_err(|error| error.to_string())?;
+        Ok(ScanConfig {
+            paths: parse_string_list_json(&paths_json),
+            excluded_paths: parse_string_list_json(&excluded_paths_json),
+        })
+    } else {
+        Ok(ScanConfig {
+            paths: Vec::new(),
+            excluded_paths: Vec::new(),
+        })
+    }
+}
+
 fn load_library(conn: &Connection) -> Result<LibraryData, String> {
     let music_artist_rules = load_merge_rules(conn, "music_artist")?;
     let video_series_rules = load_merge_rules(conn, "video_series")?;
@@ -2327,12 +2553,29 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS scan_runs (
+      id INTEGER PRIMARY KEY,
+      started_at_ms INTEGER NOT NULL,
+      completed_at_ms INTEGER NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      scanned_files INTEGER NOT NULL,
+      imported_files INTEGER NOT NULL,
+      skipped_files INTEGER NOT NULL,
+      skipped_short_files INTEGER NOT NULL,
+      recorded_directories INTEGER NOT NULL,
+      ffprobe_missing INTEGER NOT NULL DEFAULT 0,
+      paths_json TEXT NOT NULL DEFAULT '[]',
+      excluded_paths_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE INDEX IF NOT EXISTS idx_media_files_item_key ON media_files(item_key);
     CREATE INDEX IF NOT EXISTS idx_media_files_title ON media_files(title_guess);
     CREATE INDEX IF NOT EXISTS idx_media_files_root ON media_files(root_path);
     CREATE INDEX IF NOT EXISTS idx_merge_rules_kind ON merge_rules(kind);
     CREATE INDEX IF NOT EXISTS idx_scan_skips_root ON scan_skips(root_path);
     CREATE INDEX IF NOT EXISTS idx_scan_skips_short ON scan_skips(is_short_video);
+    CREATE INDEX IF NOT EXISTS idx_scan_runs_completed ON scan_runs(completed_at_ms DESC);
     "#,
     )?;
 
@@ -2386,7 +2629,6 @@ fn setup_database(app: &tauri::AppHandle) -> Result<DbState, Box<dyn std::error:
     let conn = Connection::open(&db_path)?;
     init_schema(&conn)?;
     Ok(DbState {
-        conn: Mutex::new(conn),
         db_path,
         scan_running: Mutex::new(false),
         stop_requested: Arc::new(AtomicBool::new(false)),
@@ -2580,6 +2822,8 @@ pub fn run() {
             start_scan,
             list_library,
             list_scan_skips,
+            list_scan_history,
+            get_last_scan_config,
             set_merge_rules,
             stop_scan,
             skip_current_file

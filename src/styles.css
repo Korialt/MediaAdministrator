@@ -312,7 +312,13 @@ button.danger {
   color: var(--accent-text);
 }
 
-.skip-list {
+.side-action-row {
+  display: grid;
+  gap: 8px;
+}
+
+.skip-list,
+.scan-history {
   display: grid;
   gap: 8px;
   max-height: 320px;
@@ -323,7 +329,8 @@ button.danger {
   padding: 9px;
 }
 
-.skip-list-header {
+.skip-list-header,
+.scan-history-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -332,33 +339,39 @@ button.danger {
   font-size: 12px;
 }
 
-.skip-list-header span {
+.skip-list-header span,
+.scan-history-header span {
   color: var(--muted);
 }
 
-.skip-item {
+.skip-item,
+.scan-run {
   display: grid;
   gap: 5px;
   border-top: 1px solid var(--border-soft);
   padding-top: 8px;
 }
 
-.skip-item div {
+.skip-item div,
+.scan-run div {
   display: grid;
   gap: 3px;
 }
 
-.skip-item strong {
+.skip-item strong,
+.scan-run strong {
   overflow-wrap: anywhere;
 }
 
-.skip-item span {
+.skip-item span,
+.scan-run span {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
 }
 
-.skip-item code {
+.skip-item code,
+.scan-run code {
   overflow-wrap: anywhere;
   white-space: normal;
 }
