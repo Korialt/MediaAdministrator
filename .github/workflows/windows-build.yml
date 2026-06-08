@@ -20,16 +20,16 @@ on:
 jobs:
   build-windows:
     name: Build Windows Packages
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     permissions:
       contents: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
 
@@ -64,14 +64,14 @@ jobs:
           Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe" $installerDir
 
       - name: Upload Windows portable package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Media-Administrator-windows-x64-portable
           path: artifacts/*portable.zip
           if-no-files-found: error
 
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Media-Administrator-windows-x64-installer
           path: artifacts/windows-x64-installer/*.exe
