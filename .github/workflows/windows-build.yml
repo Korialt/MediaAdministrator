@@ -157,8 +157,8 @@ jobs:
             throw "No release assets found."
           }
 
-          if (gh release view $tag *> $null) {
-            gh release upload $tag @assets --clobber
+          if (gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null) {
+            gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $tag @assets --title $title --notes "Windows x64 build for $tag." --target $env:GITHUB_SHA
+            gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --title $title --notes "Windows x64 build for $tag." --target $env:GITHUB_SHA
           }
