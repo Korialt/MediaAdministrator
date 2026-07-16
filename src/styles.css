@@ -222,9 +222,30 @@ button.danger {
   color: var(--muted);
 }
 
-.status {
-  margin: 0;
-  line-height: 1.5;
+.status-list {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface-alt);
+  padding: 9px 10px;
+}
+
+.status-list div {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.status-list span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status-list strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .progress-block {
@@ -344,6 +365,11 @@ button.danger {
   color: var(--muted);
 }
 
+.skip-list-header button,
+.scan-history-header button {
+  padding: 4px 7px;
+}
+
 .skip-item,
 .scan-run {
   display: grid;
@@ -374,6 +400,26 @@ button.danger {
 .scan-run code {
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+.root-failure {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  border-left: 3px solid var(--danger);
+  padding-left: 8px;
+}
+
+.root-failure code,
+.root-failure span,
+.run-error {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.run-error {
+  color: var(--danger);
+  font-size: 12px;
 }
 
 .current-path {
@@ -620,6 +666,14 @@ button.danger {
   padding: 12px 14px;
 }
 
+.merge-controls {
+  display: grid;
+}
+
+.family-form {
+  border-top-style: dashed;
+}
+
 .merge-form label {
   display: grid;
   gap: 6px;
@@ -644,6 +698,31 @@ button.danger {
 .file-table-wrap {
   border-top: 1px solid var(--border-soft);
   overflow: auto;
+}
+
+.inline-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--muted);
+  padding: 14px 16px;
+}
+
+.inline-state button {
+  flex: 0 0 auto;
+}
+
+.error-state {
+  color: var(--danger);
+}
+
+.load-more {
+  width: 100%;
+  border-width: 1px 0 0;
+  border-radius: 0;
+  color: var(--accent-text);
 }
 
 .directory-card .file-table-wrap {

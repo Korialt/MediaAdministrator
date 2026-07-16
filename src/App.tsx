@@ -3,7 +3,20 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { LibraryData, MediaDirectory, MediaGroup, ResourceVariant, ScanConfig, ScanProgress, ScanRun, ScanSkip, ScanSummary } from "./types";
+import type {
+  LibraryData,
+  MediaDirectory,
+  MediaGroup,
+  ResourcePage,
+  ResourceVariant,
+  ScanConfig,
+  ScanFailureEvent,
+  ScanProgress,
+  ScanRun,
+  ScanRunStatus,
+  ScanSkip,
+  ScanSummary,
+} from "./types";
 
 const EMPTY_LIBRARY: LibraryData = { musicDirectories: [], videoDirectories: [], musicArtists: [], videoSeries: [] };
 
@@ -12,7 +25,7 @@ type ViewMode = "list" | "grid";
 type ActiveEntry = "home" | "music" | "video";
 type MusicBrowseMode = "directory" | "artist";
 type VideoBrowseMode = "directory" | "series";
-type MergeKind = "music_artist" | "video_series";
+type MergeKind = "music_artist" | "video_series" | "video_family";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "-";
@@ -87,10 +100,20 @@ function processingSpeed(progress: ScanProgress | null, nowMs: number): string {
 }
 
 function skipReasonLabel(reason: string): string {
-  if (reason === "analysis_failed") return "分析失败";
-  if (reason === "manual_skip") return "手动跳过";
+  if (reason === "ffprobe_error") return "ffprobe 分析失败";
+  if (reason === "metadata_error") return "元数据读取失败";
+  if (reason === "no_media_stream") return "没有有效媒体流";
+  if (reason === "invalid_path") return "路径无效";
   if (reason === "short_video") return "短视频";
   return reason || "未知原因";
+}
+
+function scanRunStatusLabel(status: ScanRunStatus): string {
+  if (status === "running") return "运行中";
+  if (status === "completed") return "已完成";
+  if (status === "partial") return "部分完成";
+  if (status === "stopped") return "已停止";
+  return "失败";
 }
 
 function directoryMatches(directory: MediaDirectory, query: string): boolean {
@@ -99,7 +122,7 @@ function directoryMatches(directory: MediaDirectory, query: string): boolean {
   if (directory.name.toLowerCase().includes(text)) return true;
   if (directory.relativePath.toLowerCase().includes(text)) return true;
   if (directory.path.toLowerCase().includes(text)) return true;
-  return directory.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text));
+  return false;
 }
 
 function groupMatches(group: MediaGroup, query: string): boolean {
@@ -108,7 +131,6 @@ function groupMatches(group: MediaGroup, query: string): boolean {
   if (group.name.toLowerCase().includes(text)) return true;
   if (group.subtitle?.toLowerCase().includes(text)) return true;
   if (group.sourceKeys.some((key) => key.toLowerCase().includes(text))) return true;
-  if (group.files.some((file) => file.fileName.toLowerCase().includes(text) || file.path.toLowerCase().includes(text))) return true;
   return group.childGroups.some((child) => groupMatches(child, query));
 }
 
@@ -119,6 +141,22 @@ function fileSpec(file: ResourceVariant): string {
 
 function directoryTitle(directory: MediaDirectory): string {
   return directory.relativePath || directory.name;
+}
+
+function normalizedPathForComparison(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function pathIsWithin(candidate: string, parent: string): boolean {
+  const candidatePath = normalizedPathForComparison(candidate);
+  const parentPath = normalizedPathForComparison(parent);
+  return candidatePath === parentPath || candidatePath.startsWith(`${parentPath}/`);
+}
+
+function pathIsStrictlyWithin(candidate: string, parent: string): boolean {
+  const candidatePath = normalizedPathForComparison(candidate);
+  const parentPath = normalizedPathForComparison(parent);
+  return candidatePath.startsWith(`${parentPath}/`);
 }
 
 function fileMeta(file: ResourceVariant): string {
@@ -160,6 +198,97 @@ function FileRows({ files }: { files: ResourceVariant[] }) {
   );
 }
 
+type ResourceLoadRequest = {
+  kind: "directory" | "music_artist" | "video_series";
+  mediaKind: "music" | "video";
+  key: string;
+  sourceKeys: string[];
+};
+
+function LazyFileRows({ active, request }: { active: boolean; request: ResourceLoadRequest }) {
+  const [files, setFiles] = useState<ResourceVariant[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
+  const loadingRef = useRef(false);
+  const requestKey = `${request.kind}:${request.mediaKind}:${request.key}:${request.sourceKeys.join("|")}`;
+
+  async function loadPage(offset: number, replace: boolean) {
+    if (loadingRef.current) return;
+    const requestId = ++requestIdRef.current;
+    loadingRef.current = true;
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await invoke<ResourcePage>("list_resources", {
+        request: {
+          ...request,
+          offset,
+          limit: 200,
+        },
+      });
+      if (requestId !== requestIdRef.current) return;
+      setFiles((current) => (replace ? page.files : [...current, ...page.files]));
+      setTotal(page.total);
+      setLoaded(true);
+    } catch (loadError) {
+      if (requestId !== requestIdRef.current) return;
+      setError(String(loadError));
+      setLoaded(true);
+    } finally {
+      if (requestId === requestIdRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
+    }
+  }
+
+  useEffect(() => {
+    requestIdRef.current += 1;
+    loadingRef.current = false;
+    setFiles([]);
+    setTotal(0);
+    setLoaded(false);
+    setLoading(false);
+    setError(null);
+    return () => {
+      requestIdRef.current += 1;
+      loadingRef.current = false;
+    };
+  }, [requestKey]);
+
+  useEffect(() => {
+    if (active && !loaded && !loading) void loadPage(0, true);
+  }, [active, loaded, loading, requestKey]);
+
+  if (!active) return null;
+  if (!loaded && loading) return <div className="inline-state">正在读取文件...</div>;
+  if (error) {
+    return (
+      <div className="inline-state error-state">
+        <span>{error}</span>
+        <button type="button" onClick={() => void loadPage(0, true)}>
+          重试
+        </button>
+      </div>
+    );
+  }
+  if (loaded && files.length === 0) return <div className="inline-state">当前分类没有可显示的文件。</div>;
+
+  return (
+    <>
+      <FileRows files={files} />
+      {files.length < total ? (
+        <button type="button" className="load-more" disabled={loading} onClick={() => void loadPage(files.length, false)}>
+          {loading ? "读取中" : `加载更多（${files.length} / ${total}）`}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
 function DirectoryItem({ directory, mode }: { directory: MediaDirectory; mode: ViewMode }) {
   const [open, setOpen] = useState(false);
 
@@ -175,53 +304,109 @@ function DirectoryItem({ directory, mode }: { directory: MediaDirectory; mode: V
           {directory.fileCount} 个文件 · {formatBytes(directory.totalSize)}
         </b>
       </summary>
-      {open ? <FileRows files={directory.files} /> : null}
+      <LazyFileRows
+        active={open}
+        request={{ kind: "directory", mediaKind: directory.mediaKind, key: directory.key, sourceKeys: [] }}
+      />
     </details>
   );
 }
 
-function MergeControls({ group, mergeKind, onMerge }: { group: MediaGroup; mergeKind: MergeKind; onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void> }) {
+function MergeControls({
+  group,
+  mergeKind,
+  disabled,
+  onMerge,
+}: {
+  group: MediaGroup;
+  mergeKind: "music_artist" | "video_series";
+  disabled: boolean;
+  onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void>;
+}) {
   const [targetName, setTargetName] = useState(group.name);
-  const [busy, setBusy] = useState(false);
+  const [familyName, setFamilyName] = useState(group.familyName ?? "");
+  const [busyKind, setBusyKind] = useState<MergeKind | null>(null);
 
   useEffect(() => {
     setTargetName(group.name);
-  }, [group.key, group.name]);
+    setFamilyName(group.familyName ?? "");
+  }, [group.key, group.name, group.familyName]);
 
-  async function submit(target: string) {
-    setBusy(true);
+  async function submit(kind: MergeKind, target: string) {
+    setBusyKind(kind);
     try {
-      await onMerge(mergeKind, group, target);
+      await onMerge(kind, group, target);
     } finally {
-      setBusy(false);
+      setBusyKind(null);
     }
   }
 
+  const busy = busyKind != null;
   return (
-    <form
-      className="merge-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void submit(targetName);
-      }}
-    >
-      <label>
-        合并到
-        <input value={targetName} onChange={(event) => setTargetName(event.target.value)} placeholder="目标名称" />
-      </label>
-      <button type="submit" className="primary" disabled={busy || targetName.trim().length === 0}>
-        合并
-      </button>
-      <button type="button" disabled={busy} onClick={() => void submit("")}>
-        清除规则
-      </button>
-    </form>
+    <div className="merge-controls">
+      <form
+        className="merge-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit(mergeKind, targetName);
+        }}
+      >
+        <label>
+          合并到
+          <input disabled={disabled || busy} value={targetName} onChange={(event) => setTargetName(event.target.value)} placeholder="目标名称" />
+        </label>
+        <button type="submit" className="primary" disabled={disabled || busy || targetName.trim().length === 0}>
+          {busyKind === mergeKind ? "保存中" : "合并"}
+        </button>
+        <button type="button" disabled={disabled || busy} onClick={() => void submit(mergeKind, "")}>
+          清除规则
+        </button>
+      </form>
+
+      {mergeKind === "video_series" && group.childGroups.length === 0 ? (
+        <form
+          className="merge-form family-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit("video_family", familyName);
+          }}
+        >
+          <label>
+            作品族
+            <input disabled={disabled || busy} value={familyName} onChange={(event) => setFamilyName(event.target.value)} placeholder="例如 Fate" />
+          </label>
+          <button type="submit" className="primary" disabled={disabled || busy || familyName.trim().length === 0}>
+            {busyKind === "video_family" ? "保存中" : "设定"}
+          </button>
+          <button type="button" disabled={disabled || busy || group.familyName == null} onClick={() => void submit("video_family", "")}>
+            清除作品族
+          </button>
+        </form>
+      ) : null}
+    </div>
   );
 }
 
-function GroupItem({ group, mode, mergeKind, onMerge, nested = false }: { group: MediaGroup; mode: ViewMode; mergeKind: MergeKind; onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void>; nested?: boolean }) {
+function GroupItem({
+  group,
+  mode,
+  mergeKind,
+  disabled,
+  revision,
+  onMerge,
+  nested = false,
+}: {
+  group: MediaGroup;
+  mode: ViewMode;
+  mergeKind: "music_artist" | "video_series";
+  disabled: boolean;
+  revision: number;
+  onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void>;
+  nested?: boolean;
+}) {
   const hasChildren = group.childGroups.length > 0;
   const [open, setOpen] = useState(false);
+  const mediaKind = mergeKind === "music_artist" ? "music" : "video";
 
   return (
     <details className={`${mode === "grid" && !nested ? "directory-card" : "directory-row"}${nested ? " nested-group" : ""}`} onToggle={(event) => setOpen(event.currentTarget.open)}>
@@ -235,15 +420,34 @@ function GroupItem({ group, mode, mergeKind, onMerge, nested = false }: { group:
           {group.fileCount} 个文件 · {formatBytes(group.totalSize)}
         </b>
       </summary>
-      {open ? <MergeControls group={group} mergeKind={mergeKind} onMerge={onMerge} /> : null}
+      {open ? <MergeControls group={group} mergeKind={mergeKind} disabled={disabled} onMerge={onMerge} /> : null}
       {open && hasChildren ? (
         <div className="child-group-list">
           {group.childGroups.map((child) => (
-            <GroupItem group={child} key={child.key} mode="list" mergeKind={mergeKind} onMerge={onMerge} nested />
+            <GroupItem
+              group={child}
+              key={`${child.key}:${revision}`}
+              mode="list"
+              mergeKind={mergeKind}
+              disabled={disabled}
+              revision={revision}
+              onMerge={onMerge}
+              nested
+            />
           ))}
         </div>
       ) : null}
-      {open && !hasChildren ? <FileRows files={group.files} /> : null}
+      {!hasChildren ? (
+        <LazyFileRows
+          active={open}
+          request={{
+            kind: mergeKind,
+            mediaKind,
+            key: group.key,
+            sourceKeys: group.resourceKeys,
+          }}
+        />
+      ) : null}
     </details>
   );
 }
@@ -253,11 +457,13 @@ function DirectorySection({
   emptyText,
   directories,
   mode,
+  revision,
 }: {
   title: string;
   emptyText: string;
   directories: MediaDirectory[];
   mode: ViewMode;
+  revision: number;
 }) {
   return (
     <section className="library-section">
@@ -270,7 +476,7 @@ function DirectorySection({
 
       <div className={mode === "grid" ? "directory-grid" : "directory-list"}>
         {directories.map((directory) => (
-          <DirectoryItem directory={directory} key={directory.key} mode={mode} />
+          <DirectoryItem directory={directory} key={`${directory.key}:${revision}`} mode={mode} />
         ))}
       </div>
     </section>
@@ -283,13 +489,17 @@ function GroupSection({
   groups,
   mode,
   mergeKind,
+  disabled,
+  revision,
   onMerge,
 }: {
   title: string;
   emptyText: string;
   groups: MediaGroup[];
   mode: ViewMode;
-  mergeKind: MergeKind;
+  mergeKind: "music_artist" | "video_series";
+  disabled: boolean;
+  revision: number;
   onMerge: (kind: MergeKind, group: MediaGroup, targetName: string) => Promise<void>;
 }) {
   return (
@@ -303,7 +513,15 @@ function GroupSection({
 
       <div className={mode === "grid" ? "directory-grid" : "directory-list"}>
         {groups.map((group) => (
-          <GroupItem group={group} key={group.key} mode={mode} mergeKind={mergeKind} onMerge={onMerge} />
+          <GroupItem
+            group={group}
+            key={`${group.key}:${revision}`}
+            mode={mode}
+            mergeKind={mergeKind}
+            disabled={disabled}
+            revision={revision}
+            onMerge={onMerge}
+          />
         ))}
       </div>
     </section>
@@ -351,13 +569,20 @@ export default function App() {
   const [paths, setPaths] = useState<string[]>([]);
   const [excludedPaths, setExcludedPaths] = useState<string[]>([]);
   const [library, setLibrary] = useState<LibraryData>(EMPTY_LIBRARY);
+  const [searchResult, setSearchResult] = useState<{ query: string; data: LibraryData } | null>(null);
   const [query, setQuery] = useState("");
-  const [status, setStatus] = useState("正在检查 ffprobe...");
+  const [systemStatus, setSystemStatus] = useState("正在初始化...");
+  const [scanStatus, setScanStatus] = useState("扫描未启动");
+  const [libraryStatus, setLibraryStatus] = useState("正在读取媒体库...");
+  const [listenersReady, setListenersReady] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isLoadingLibrary, setIsLoadingLibrary] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
+  const [libraryRevision, setLibraryRevision] = useState(0);
   const [isLoadingSkips, setIsLoadingSkips] = useState(false);
   const [skipListVisible, setSkipListVisible] = useState(false);
+  const [selectedSkipScanId, setSelectedSkipScanId] = useState<number | null>(null);
   const [scanSkips, setScanSkips] = useState<ScanSkip[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [scanHistoryVisible, setScanHistoryVisible] = useState(false);
@@ -371,23 +596,30 @@ export default function App() {
   const [videoBrowseMode, setVideoBrowseMode] = useState<VideoBrowseMode>("directory");
   const [nowMs, setNowMs] = useState(() => Date.now());
   const scanStartedAtRef = useRef<number | null>(null);
+  const libraryRequestIdRef = useRef(0);
 
   async function refreshLibrary(successStatus?: string) {
+    const requestId = ++libraryRequestIdRef.current;
     setIsLoadingLibrary(true);
+    setLibraryStatus(successStatus ? "正在刷新媒体库..." : "正在读取媒体库...");
     try {
-      const data = await invoke<LibraryData>("list_library");
+      const data = await invoke<LibraryData>("list_library", { query: null });
+      if (requestId !== libraryRequestIdRef.current) return;
       setLibrary(data);
-      if (successStatus) setStatus(successStatus);
+      setSearchResult(null);
+      setLibraryRevision((current) => current + 1);
+      setLibraryStatus(successStatus ?? "媒体库读取完成");
     } catch (error) {
-      setStatus(String(error));
+      if (requestId !== libraryRequestIdRef.current) return;
+      setLibraryStatus(`媒体库读取失败：${String(error)}`);
     } finally {
-      setIsLoadingLibrary(false);
+      if (requestId === libraryRequestIdRef.current) setIsLoadingLibrary(false);
     }
   }
 
   async function loadLastScanConfig() {
     const config = await invoke<ScanConfig>("get_last_scan_config");
-    if (config.paths.length > 0) setPaths(config.paths);
+    setPaths(config.paths);
     setExcludedPaths(config.excludedPaths);
   }
 
@@ -402,85 +634,132 @@ export default function App() {
   }, [isScanning]);
 
   useEffect(() => {
-    invoke<string>("check_ffprobe")
-      .then((message) => setStatus(message))
-      .catch((error) => setStatus(String(error)));
-    loadLastScanConfig().catch((error) => setStatus(String(error)));
-    void refreshLibrary();
-  }, []);
-
-  useEffect(() => {
     let disposed = false;
-    let unlistenProgress: UnlistenFn | null = null;
-    let unlistenComplete: UnlistenFn | null = null;
-    let unlistenError: UnlistenFn | null = null;
+    let unlisteners: UnlistenFn[] = [];
 
-    listen<ScanProgress>("scan-progress", (event) => {
-      const progress = event.payload;
-      setIsScanning(true);
-      setNowMs(Date.now());
-      scanStartedAtRef.current = progress.scanStartedAtMs;
-      setScanProgress(progress);
-      setStatus(scanStatusText(progress));
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else unlistenProgress = unlisten;
-    });
+    async function initialize() {
+      const registered = await Promise.all([
+        listen<ScanProgress>("scan-progress", (event) => {
+          const progress = event.payload;
+          setIsScanning(true);
+          setNowMs(Date.now());
+          scanStartedAtRef.current = progress.scanStartedAtMs;
+          setScanProgress(progress);
+          setScanStatus(scanStatusText(progress));
+        }),
+        listen<ScanSummary>("scan-complete", (event) => {
+          const summary = event.payload;
+          const completionStatus =
+            summary.status === "failed"
+              ? `扫描失败，${summary.failedRoots.length} 个根目录均保留了原有索引`
+              : summary.status === "partial"
+                ? `扫描部分完成，${summary.failedRoots.length} 个根目录保留了原有索引`
+                : "扫描完成";
+          setLastScan(summary);
+          setIsScanning(false);
+          setIsStopping(false);
+          setSkipListVisible(false);
+          setSelectedSkipScanId(null);
+          setScanSkips([]);
+          setScanHistoryVisible(false);
+          setScanHistory([]);
+          const completedAtMs = summary.completedAtMs || Date.now();
+          const scanStartedAtMs = summary.startedAtMs || scanStartedAtRef.current || completedAtMs;
+          setNowMs(completedAtMs);
+          setScanProgress({
+            phase: "processing",
+            discoveredFiles: summary.scannedFiles,
+            processedFiles: summary.scannedFiles,
+            importedFiles: summary.importedFiles,
+            skippedFiles: summary.skippedFiles,
+            skippedShortFiles: summary.skippedShortFiles,
+            totalFiles: summary.scannedFiles,
+            currentPath: null,
+            detail: completionStatus,
+            scanStartedAtMs,
+            currentFileStartedAtMs: null,
+            updatedAtMs: completedAtMs,
+            ffprobeMissing: summary.ffprobeMissing,
+          });
+          setScanStatus(completionStatus);
+          void refreshLibrary(completionStatus);
+          void loadLastScanConfig().catch((error) => setSystemStatus(`扫描配置读取失败：${String(error)}`));
+        }),
+        listen<ScanFailureEvent>("scan-error", (event) => {
+          const failure = event.payload;
+          setIsScanning(false);
+          setIsStopping(false);
+          scanStartedAtRef.current = null;
+          setScanStatus(failure.status === "stopped" ? "扫描已停止" : failure.message);
+          setScanProgress((current) =>
+            current
+              ? {
+                  ...current,
+                  currentPath: null,
+                  currentFileStartedAtMs: null,
+                  detail: failure.status === "stopped" ? "扫描已停止" : "扫描失败",
+                  updatedAtMs: Date.now(),
+                }
+              : current,
+          );
+          void refreshLibrary();
+        }),
+      ]);
 
-    listen<ScanSummary>("scan-complete", (event) => {
-      const summary = event.payload;
-      const completionStatus = summary.ffprobeMissing ? "扫描完成，但没有找到 ffprobe，短视频过滤可能不完整" : "扫描完成";
-      setLastScan(summary);
-      setIsScanning(false);
-      setIsStopping(false);
-      setSkipListVisible(false);
-      setScanSkips([]);
-      setScanHistoryVisible(false);
-      setScanHistory([]);
-      const completedAtMs = summary.completedAtMs || Date.now();
-      const scanStartedAtMs = summary.startedAtMs || scanStartedAtRef.current || completedAtMs;
-      setNowMs(completedAtMs);
-      setScanProgress({
-        phase: "processing",
-        discoveredFiles: summary.scannedFiles,
-        processedFiles: summary.scannedFiles,
-        importedFiles: summary.importedFiles,
-        skippedFiles: summary.skippedFiles,
-        skippedShortFiles: summary.skippedShortFiles,
-        totalFiles: summary.scannedFiles,
-        currentPath: null,
-        detail: "扫描完成",
-        scanStartedAtMs,
-        currentFileStartedAtMs: null,
-        updatedAtMs: completedAtMs,
-        canSkipCurrentFile: false,
-        ffprobeMissing: summary.ffprobeMissing,
-      });
-      setStatus(`${completionStatus}，正在后台刷新媒体库...`);
-      void refreshLibrary(completionStatus);
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else unlistenComplete = unlisten;
-    });
+      if (disposed) {
+        registered.forEach((unlisten) => unlisten());
+        return;
+      }
+      unlisteners = registered;
+      setListenersReady(true);
+      setSystemStatus("正在检查 ffprobe...");
 
-    listen<string>("scan-error", (event) => {
-      setIsScanning(false);
-      setIsStopping(false);
-      scanStartedAtRef.current = null;
-      setStatus(String(event.payload));
+      void invoke<string>("check_ffprobe")
+        .then((message) => setSystemStatus(message))
+        .catch((error) => setSystemStatus(`ffprobe 检查失败：${String(error)}`));
+      void loadLastScanConfig().catch((error) => setSystemStatus(`扫描配置读取失败：${String(error)}`));
       void refreshLibrary();
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else unlistenError = unlisten;
+    }
+
+    void initialize().catch((error) => {
+      setListenersReady(false);
+      setSystemStatus(`初始化失败：${String(error)}`);
     });
 
     return () => {
       disposed = true;
-      unlistenProgress?.();
-      unlistenComplete?.();
-      unlistenError?.();
+      unlisteners.forEach((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery || !listenersReady) {
+      setSearchResult(null);
+      setIsSearching(false);
+      return;
+    }
+
+    let disposed = false;
+    const timer = window.setTimeout(() => {
+      setIsSearching(true);
+      invoke<LibraryData>("list_library", { query: normalizedQuery })
+        .then((data) => {
+          if (!disposed) setSearchResult({ query: normalizedQuery, data });
+        })
+        .catch((error) => {
+          if (!disposed) setLibraryStatus(`搜索失败：${String(error)}`);
+        })
+        .finally(() => {
+          if (!disposed) setIsSearching(false);
+        });
+    }, 250);
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [query, listenersReady, libraryRevision]);
 
   async function chooseDirectories() {
     const selected = await open({
@@ -488,22 +767,33 @@ export default function App() {
       multiple: true,
       title: "选择媒体目录",
     });
-
     if (!selected) return;
     const next = Array.isArray(selected) ? selected : [selected];
     setPaths((current) => Array.from(new Set([...current, ...next])));
   }
 
   async function chooseExcludedDirectories() {
+    if (paths.length === 0) {
+      setScanStatus("请先选择扫描目录");
+      return;
+    }
     const selected = await open({
       directory: true,
       multiple: true,
       title: "选择排除子目录",
     });
-
     if (!selected) return;
     const next = Array.isArray(selected) ? selected : [selected];
-    setExcludedPaths((current) => Array.from(new Set([...current, ...next])));
+    const valid = next.filter((candidate) => paths.some((root) => pathIsStrictlyWithin(candidate, root)));
+    setExcludedPaths((current) => Array.from(new Set([...current, ...valid])));
+    if (valid.length !== next.length) {
+      setScanStatus("部分目录未加入：排除目录必须位于扫描目录内部");
+    }
+  }
+
+  function removePath(path: string) {
+    setPaths((current) => current.filter((item) => item !== path));
+    setExcludedPaths((current) => current.filter((item) => !pathIsWithin(item, path)));
   }
 
   function removeExcludedPath(path: string) {
@@ -511,12 +801,13 @@ export default function App() {
   }
 
   async function scan() {
-    if (paths.length === 0) return;
+    if (paths.length === 0 || !listenersReady) return;
     const startedAtMs = Date.now();
     setIsScanning(true);
     setIsStopping(false);
     setLastScan(null);
     setSkipListVisible(false);
+    setSelectedSkipScanId(null);
     setScanSkips([]);
     setScanHistoryVisible(false);
     setScanHistory([]);
@@ -535,39 +826,39 @@ export default function App() {
       scanStartedAtMs: startedAtMs,
       currentFileStartedAtMs: null,
       updatedAtMs: startedAtMs,
-      canSkipCurrentFile: false,
       ffprobeMissing: false,
     });
-    setStatus("后台扫描已启动...");
+    setScanStatus("后台扫描已启动...");
     try {
       await invoke<void>("start_scan", { paths, excludedPaths });
     } catch (error) {
-      setStatus(String(error));
+      setScanStatus(String(error));
       setIsScanning(false);
     }
   }
 
   async function stopScan() {
     setIsStopping(true);
-    setStatus("正在停止扫描...");
+    setScanStatus("正在停止扫描...");
     try {
       await invoke<void>("stop_scan");
     } catch (error) {
       setIsStopping(false);
-      setStatus(String(error));
+      setScanStatus(String(error));
     }
   }
 
-  async function showScanSkips() {
+  async function showScanSkips(scanId: number) {
     setIsLoadingSkips(true);
-    setStatus("正在读取跳过清单...");
+    setSelectedSkipScanId(scanId);
+    setScanStatus(`正在读取扫描 #${scanId} 的跳过清单...`);
     try {
-      const skips = await invoke<ScanSkip[]>("list_scan_skips");
+      const skips = await invoke<ScanSkip[]>("list_scan_skips", { scanId });
       setScanSkips(skips);
       setSkipListVisible(true);
-      setStatus(skips.length > 0 ? `已加载 ${skips.length} 个跳过项` : "没有非短视频跳过项");
+      setScanStatus(skips.length > 0 ? `已加载 ${skips.length} 个跳过项` : "该次扫描没有非短视频跳过项");
     } catch (error) {
-      setStatus(String(error));
+      setScanStatus(String(error));
     } finally {
       setIsLoadingSkips(false);
     }
@@ -575,21 +866,21 @@ export default function App() {
 
   async function showScanHistory() {
     setIsLoadingHistory(true);
-    setStatus("正在读取扫描历史...");
+    setScanStatus("正在读取扫描历史...");
     try {
       const runs = await invoke<ScanRun[]>("list_scan_history");
       setScanHistory(runs);
       setScanHistoryVisible(true);
-      setStatus(runs.length > 0 ? `已加载 ${runs.length} 条扫描历史` : "没有扫描历史记录");
+      setScanStatus(runs.length > 0 ? `已加载 ${runs.length} 条扫描历史` : "没有扫描历史记录");
     } catch (error) {
-      setStatus(String(error));
+      setScanStatus(String(error));
     } finally {
       setIsLoadingHistory(false);
     }
   }
 
   async function applyMerge(kind: MergeKind, group: MediaGroup, targetName: string) {
-    setStatus(targetName.trim() ? "正在保存合并规则..." : "正在清除合并规则...");
+    setLibraryStatus(targetName.trim() ? "正在保存分类规则..." : "正在清除分类规则...");
     try {
       const data = await invoke<LibraryData>("set_merge_rules", {
         request: {
@@ -599,22 +890,46 @@ export default function App() {
         },
       });
       setLibrary(data);
-      setStatus(targetName.trim() ? "合并规则已保存" : "合并规则已清除");
+      setSearchResult(null);
+      setLibraryRevision((current) => current + 1);
+      setLibraryStatus(targetName.trim() ? "分类规则已保存" : "分类规则已清除");
     } catch (error) {
-      setStatus(String(error));
+      setLibraryStatus(String(error));
     }
   }
 
+  const normalizedQuery = query.trim();
+  const matchedSearchResult = searchResult?.query === normalizedQuery ? searchResult.data : null;
+  const visibleLibrary = matchedSearchResult ?? library;
+  const useLocalSummaryFilter = normalizedQuery.length > 0 && matchedSearchResult == null;
   const musicDirectories = useMemo(
-    () => library.musicDirectories.filter((directory) => directoryMatches(directory, query)),
-    [library, query],
+    () =>
+      useLocalSummaryFilter
+        ? visibleLibrary.musicDirectories.filter((directory) => directoryMatches(directory, query))
+        : visibleLibrary.musicDirectories,
+    [visibleLibrary, query, useLocalSummaryFilter],
   );
   const videoDirectories = useMemo(
-    () => library.videoDirectories.filter((directory) => directoryMatches(directory, query)),
-    [library, query],
+    () =>
+      useLocalSummaryFilter
+        ? visibleLibrary.videoDirectories.filter((directory) => directoryMatches(directory, query))
+        : visibleLibrary.videoDirectories,
+    [visibleLibrary, query, useLocalSummaryFilter],
   );
-  const musicArtists = useMemo(() => library.musicArtists.filter((group) => groupMatches(group, query)), [library, query]);
-  const videoSeries = useMemo(() => library.videoSeries.filter((group) => groupMatches(group, query)), [library, query]);
+  const musicArtists = useMemo(
+    () =>
+      useLocalSummaryFilter
+        ? visibleLibrary.musicArtists.filter((group) => groupMatches(group, query))
+        : visibleLibrary.musicArtists,
+    [visibleLibrary, query, useLocalSummaryFilter],
+  );
+  const videoSeries = useMemo(
+    () =>
+      useLocalSummaryFilter
+        ? visibleLibrary.videoSeries.filter((group) => groupMatches(group, query))
+        : visibleLibrary.videoSeries,
+    [visibleLibrary, query, useLocalSummaryFilter],
+  );
 
   const totals = useMemo(() => {
     const musicFiles = library.musicDirectories.reduce((sum, directory) => sum + directory.fileCount, 0);
@@ -645,7 +960,7 @@ export default function App() {
       : videoBrowseMode === "directory"
         ? "影视目录"
         : "影视系列";
-  const activeEmptyText = activeEntry === "music" ? "暂无音乐资源。" : "暂无影视资源。";
+  const activeEmptyText = isLoadingLibrary ? "正在读取媒体库..." : normalizedQuery ? "没有匹配的资源。" : activeEntry === "music" ? "暂无音乐资源。" : "暂无影视资源。";
 
   return (
     <main className="app-shell">
@@ -665,13 +980,16 @@ export default function App() {
           <div className="path-list">
             {paths.length === 0 ? <span className="muted">未选择目录</span> : null}
             {paths.map((path) => (
-              <div className="path-chip" key={path} title={path}>
-                {path}
+              <div className="path-chip removable" key={path} title={path}>
+                <span>{path}</span>
+                <button type="button" disabled={isScanning} onClick={() => removePath(path)}>
+                  移除
+                </button>
               </div>
             ))}
           </div>
           <div className="button-row">
-            <button type="button" onClick={chooseDirectories}>
+            <button type="button" disabled={isScanning} onClick={chooseDirectories}>
               选择目录
             </button>
             {isScanning ? (
@@ -679,7 +997,7 @@ export default function App() {
                 停止
               </button>
             ) : (
-              <button type="button" className="primary" disabled={paths.length === 0} onClick={scan}>
+              <button type="button" className="primary" disabled={paths.length === 0 || !listenersReady} onClick={scan}>
                 扫描
               </button>
             )}
@@ -687,7 +1005,7 @@ export default function App() {
 
           <div className="exclude-header">
             <span>排除子目录</span>
-            <button type="button" onClick={chooseExcludedDirectories}>
+            <button type="button" disabled={isScanning} onClick={chooseExcludedDirectories}>
               添加排除
             </button>
           </div>
@@ -696,7 +1014,7 @@ export default function App() {
             {excludedPaths.map((path) => (
               <div className="path-chip removable" key={path} title={path}>
                 <span>{path}</span>
-                <button type="button" onClick={() => removeExcludedPath(path)}>
+                <button type="button" disabled={isScanning} onClick={() => removeExcludedPath(path)}>
                   移除
                 </button>
               </div>
@@ -733,8 +1051,22 @@ export default function App() {
 
         <section className="panel">
           <div className="panel-title">状态</div>
-          <p className="status">{status}</p>
+          <div className="status-list">
+            <div>
+              <span>系统</span>
+              <strong>{systemStatus}</strong>
+            </div>
+            <div>
+              <span>扫描</span>
+              <strong>{scanStatus}</strong>
+            </div>
+            <div>
+              <span>媒体库</span>
+              <strong>{libraryStatus}</strong>
+            </div>
+          </div>
           {isLoadingLibrary ? <p className="muted">媒体库正在后台读取...</p> : null}
+          {isSearching ? <p className="muted">正在后台搜索文件路径...</p> : null}
           {scanProgress ? (
             <div className="progress-block">
               <div className="progress-bar" data-indeterminate={percent == null && isScanning ? "true" : "false"}>
@@ -788,24 +1120,38 @@ export default function App() {
           {lastScan ? (
             <div className="last-scan-block">
               <p className="muted">
-                最近扫描：入库 {lastScan.importedFiles} 个媒体文件，记录 {lastScan.recordedDirectories} 个目录，短视频过滤 {lastScan.skippedShortFiles} 个，用时 {formatElapsedMs(lastScan.durationMs)}
+                最近扫描：{scanRunStatusLabel(lastScan.status)} · 入库 {lastScan.importedFiles} 个媒体文件，记录 {lastScan.recordedDirectories} 个目录，短视频过滤 {lastScan.skippedShortFiles} 个，用时 {formatElapsedMs(lastScan.durationMs)}
               </p>
-              <button type="button" className="skip-list-toggle" disabled={isLoadingSkips || isScanning} onClick={showScanSkips}>
+              {lastScan.failedRoots.map((root) => (
+                <p className="root-failure" key={root.path}>
+                  <code title={root.path}>{root.path}</code>
+                  <span>{root.detail}</span>
+                </p>
+              ))}
+              <button type="button" className="skip-list-toggle" disabled={isLoadingSkips || isScanning} onClick={() => void showScanSkips(lastScan.scanId)}>
                 {isLoadingSkips ? "读取中" : "查看跳过清单"}
               </button>
             </div>
           ) : null}
           <div className="side-action-row">
-            <button type="button" className="skip-list-toggle" disabled={isLoadingHistory || isScanning} onClick={showScanHistory}>
-              {isLoadingHistory ? "读取中" : "查看扫描历史"}
+            <button
+              type="button"
+              className="skip-list-toggle"
+              disabled={isLoadingHistory || isScanning}
+              onClick={() => (scanHistoryVisible ? setScanHistoryVisible(false) : void showScanHistory())}
+            >
+              {isLoadingHistory ? "读取中" : scanHistoryVisible ? "收起扫描历史" : "查看扫描历史"}
             </button>
           </div>
           {skipListVisible ? (
             <div className="skip-list">
               <div className="skip-list-header">
-                <strong>跳过清单</strong>
-                <span>不包含短视频过滤项</span>
+                <strong>扫描 #{selectedSkipScanId} 跳过清单</strong>
+                <button type="button" onClick={() => setSkipListVisible(false)}>
+                  关闭
+                </button>
               </div>
+              <span className="muted">不包含短视频过滤项</span>
               {scanSkips.length === 0 ? <p className="muted">没有非短视频跳过项。</p> : null}
               {scanSkips.map((item) => (
                 <div className="skip-item" key={item.id}>
@@ -828,13 +1174,27 @@ export default function App() {
               {scanHistory.map((run) => (
                 <div className="scan-run" key={run.id}>
                   <div>
-                    <strong>{formatDateTime(run.completedAtMs)}</strong>
+                    <strong>
+                      #{run.id} · {scanRunStatusLabel(run.status)} · {formatDateTime(run.completedAtMs || run.startedAtMs)}
+                    </strong>
                     <span>
                       入库 {run.importedFiles} · 跳过 {run.skippedFiles} · 短视频 {run.skippedShortFiles} · 目录 {run.recordedDirectories} · 用时 {formatElapsedMs(run.durationMs)} · ffprobe {run.ffprobeMissing ? "未找到" : "可用"}
                     </span>
                   </div>
-                  <code title={run.paths.join("\\n")}>扫描目录：{run.paths.join(" | ") || "-"}</code>
-                  {run.excludedPaths.length > 0 ? <code title={run.excludedPaths.join("\\n")}>排除目录：{run.excludedPaths.join(" | ")}</code> : null}
+                  {run.errorMessage ? <span className="run-error">{run.errorMessage}</span> : null}
+                  {run.failedRoots.map((root) => (
+                    <div className="root-failure" key={root.path}>
+                      <code title={root.path}>{root.path}</code>
+                      <span>{root.detail}</span>
+                    </div>
+                  ))}
+                  <code title={run.paths.join("\n")}>扫描目录：{run.paths.join(" | ") || "-"}</code>
+                  {run.excludedPaths.length > 0 ? <code title={run.excludedPaths.join("\n")}>排除目录：{run.excludedPaths.join(" | ")}</code> : null}
+                  {run.skippedFiles > run.skippedShortFiles ? (
+                    <button type="button" disabled={isLoadingSkips} onClick={() => void showScanSkips(run.id)}>
+                      查看本次跳过明细
+                    </button>
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -903,15 +1263,34 @@ export default function App() {
             onSelect={setActiveEntry}
           />
         ) : activeEntry === "music" && musicBrowseMode === "artist" ? (
-          <GroupSection title="音乐作者" emptyText={activeEmptyText} groups={musicArtists} mode={viewMode} mergeKind="music_artist" onMerge={applyMerge} />
+          <GroupSection
+            title="音乐作者"
+            emptyText={activeEmptyText}
+            groups={musicArtists}
+            mode={viewMode}
+            mergeKind="music_artist"
+            disabled={isScanning}
+            revision={libraryRevision}
+            onMerge={applyMerge}
+          />
         ) : activeEntry === "video" && videoBrowseMode === "series" ? (
-          <GroupSection title="影视系列" emptyText={activeEmptyText} groups={videoSeries} mode={viewMode} mergeKind="video_series" onMerge={applyMerge} />
+          <GroupSection
+            title="影视系列"
+            emptyText={activeEmptyText}
+            groups={videoSeries}
+            mode={viewMode}
+            mergeKind="video_series"
+            disabled={isScanning}
+            revision={libraryRevision}
+            onMerge={applyMerge}
+          />
         ) : (
           <DirectorySection
             title={activeTitle}
             emptyText={activeEmptyText}
             directories={activeEntry === "music" ? musicDirectories : videoDirectories}
             mode={viewMode}
+            revision={libraryRevision}
           />
         )}
       </section>

@@ -17,21 +17,29 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
 jobs:
-  build-windows:
+  build_windows:
     name: Build Windows Packages
     runs-on: windows-2025-vs2026
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
+      release_title: ${{ steps.release.outputs.title }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -45,6 +53,15 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Verify version metadata
+        run: npm run check:versions
+
+      - name: Type-check frontend
+        run: npm run typecheck
+
+      - name: Test Rust backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
       - name: Build Tauri app
         run: npm run build -- --target x86_64-pc-windows-msvc
@@ -64,14 +81,14 @@ jobs:
           Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe" $installerDir
 
       - name: Upload Windows portable package
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: Media-Administrator-windows-x64-portable
           path: artifacts/*portable.zip
           if-no-files-found: error
 
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: Media-Administrator-windows-x64-installer
           path: artifacts/windows-x64-installer/*.exe
@@ -100,22 +117,41 @@ jobs:
             $tag = "v$tag"
           }
 
+          npm run check:versions -- --tag $tag
+
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "title=Media Administrator $tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+  release:
+    name: Publish GitHub Release
+    needs: build_windows
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publishRelease) }}
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows portable package
+        uses: actions/download-artifact@v8
+        with:
+          name: Media-Administrator-windows-x64-portable
+          path: artifacts
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          name: Media-Administrator-windows-x64-installer
+          path: artifacts
+
       - name: Publish GitHub Release
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publishRelease) }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = "${{ steps.release.outputs.tag }}"
-          $title = "${{ steps.release.outputs.title }}"
-          $assets = @(
-            Get-ChildItem -Path "artifacts/*portable.zip" -File | Select-Object -ExpandProperty FullName
-            Get-ChildItem -Path "artifacts/windows-x64-installer/*.exe" -File | Select-Object -ExpandProperty FullName
-          )
+          $tag = "${{ needs.build_windows.outputs.release_tag }}"
+          $title = "${{ needs.build_windows.outputs.release_title }}"
+          $assets = @(Get-ChildItem -Path artifacts -Recurse -File | Select-Object -ExpandProperty FullName)
 
           if ($assets.Count -eq 0) {
             throw "No release assets found."

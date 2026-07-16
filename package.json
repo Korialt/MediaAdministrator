@@ -1,7 +1,7 @@
 {
   "name": "media-administrator",
   "private": true,
-  "version": "0.3.13",
+  "version": "0.3.14",
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
@@ -9,7 +9,8 @@
     "build": "tauri build",
     "build:frontend": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check:versions": "node scripts/check-versions.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

@@ -31,20 +31,33 @@ export type MediaDirectory = {
   name: string;
   relativePath: string;
   parentName: string | null;
+  mediaKind: "music" | "video";
   fileCount: number;
   totalSize: number;
-  files: ResourceVariant[];
 };
 
 export type MediaGroup = {
   key: string;
   name: string;
   subtitle: string | null;
+  familyName: string | null;
   fileCount: number;
   totalSize: number;
   sourceKeys: string[];
-  files: ResourceVariant[];
+  resourceKeys: string[];
   childGroups: MediaGroup[];
+};
+
+export type ResourcePage = {
+  files: ResourceVariant[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type FailedRoot = {
+  path: string;
+  detail: string;
 };
 
 export type LibraryData = {
@@ -65,7 +78,11 @@ export type ScanSummary = {
   skippedShortFiles: number;
   recordedDirectories: number;
   ffprobeMissing: boolean;
+  status: ScanRunStatus;
+  failedRoots: FailedRoot[];
 };
+
+export type ScanRunStatus = "running" | "completed" | "partial" | "stopped" | "failed";
 
 export type ScanRun = {
   id: number;
@@ -78,6 +95,9 @@ export type ScanRun = {
   skippedShortFiles: number;
   recordedDirectories: number;
   ffprobeMissing: boolean;
+  status: ScanRunStatus;
+  errorMessage: string | null;
+  failedRoots: FailedRoot[];
   paths: string[];
   excludedPaths: string[];
   createdAt: string;
@@ -90,6 +110,7 @@ export type ScanConfig = {
 
 export type ScanSkip = {
   id: number;
+  scanId: number | null;
   path: string;
   fileName: string;
   rootPath: string;
@@ -114,6 +135,11 @@ export type ScanProgress = {
   scanStartedAtMs: number;
   currentFileStartedAtMs: number | null;
   updatedAtMs: number;
-  canSkipCurrentFile: boolean;
   ffprobeMissing: boolean;
+};
+
+export type ScanFailureEvent = {
+  scanId: number | null;
+  status: "stopped" | "failed";
+  message: string;
 };
